@@ -4,7 +4,10 @@ This file keeps the renames and dated decisions, so the reference docs in
 `docs/` can describe the present only. Dates in parentheses are when a
 change was made.
 
-## Unreleased
+## 0.0.5 (2026-10-11)
+
+`jax-graft` 0.0.5 with `metal-pjrt-core` 0.0.5 (the frontend ABI version
+is now 2, so the two must be upgraded together).
 
 - `jax.experimental.compute_on("device_host")` works on mtl (it was
   refused before): part of a jitted GPU program runs on the CPU, reading
