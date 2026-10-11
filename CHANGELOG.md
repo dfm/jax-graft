@@ -6,6 +6,13 @@ change was made.
 
 ## Unreleased
 
+- `jax.experimental.compute_on("device_host")` works on mtl: the region
+  runs on the CPU inside the jitted GPU program, sharing its memory, so it
+  can compute in float64 (Apple GPUs have none), with JAX's CPU linear
+  algebra (jaxlib's LAPACK handlers, registered with the plugin's XLA),
+  FFT, Python callbacks and gradients. It was refused before. Needs a new
+  `metal-pjrt-core`: the frontend ABI version is 2 (new library export).
+  (2026-10-11)
 - Kernels compile as MSL 4.0 whatever SDK the Python interpreter was
   linked against: Metal's default follows that SDK, so a conda-forge
   Python (SDK 11, MSL 2.3) failed every kernel (#18). (2026-10-10)

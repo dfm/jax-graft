@@ -1,23 +1,32 @@
 # Copyright 2026 The jax-graft Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""jaxlib's CPU FFI handlers in ``compute_on("device_host")`` regions.
+"""jaxlib's CPU linear algebra in ``compute_on("device_host")`` regions.
 
 Such a region runs on the CPU: XLA compiles it with XLA:CPU inside the
-plugin's library, and JAX lowers it with its CPU rules, so it calls jaxlib's
-CPU custom calls (``lapack_dpotrf_ffi`` for a Cholesky, ...). jaxlib
-registers their handlers with its own copy of XLA, which the plugin's copy
-cannot see. The XLA FFI is a C ABI meant to cross copies of XLA, so before
-each compile this hands every typed-FFI handler jaxlib has for the host
-(LAPACK, and any a user registered with ``jax.ffi.register_ffi_target`` for
-"cpu") to the library (``metal_pjrt_register_host_ffi_handler``,
-metal_pjrt/ffi/host_ffi.cc). A handler the library cannot take (e.g. built
-against an incompatible FFI API version) is logged, and a region calling it
-fails to compile with an error naming it.
+plugin's library, and JAX lowers it with its CPU rules, so a Cholesky in it
+calls jaxlib's ``lapack_dpotrf_ffi`` (and so on), whose handlers jaxlib
+registers with its own copy of XLA, which the plugin's copy cannot see. The
+XLA FFI is a C ABI meant to cross copies of XLA (XLA checks the handler's FFI
+API version when it is registered), so the first time a region is lowered for
+mtl this hands jaxlib's linear algebra handlers
+(``jax._src.lib.lapack.registrations()``: LAPACK and the perturbed
+tridiagonal solve, all stateless) to the library
+(``metal_pjrt_register_host_ffi_handler``, metal_pjrt/ffi/host_ffi.cc), after
+``initialize()`` has loaded the LAPACK routines they call. A handler the
+library cannot take is logged, and a region calling it fails to compile with
+an error naming it.
 
-Python callbacks in a region are not jaxlib's: they lower to the plugin's
-own ``xla_ffi_python_metal_callback`` (_callbacks.py), which the library
-also registers for the host.
+Nothing else of jaxlib's is forwarded. XLA runs a region without an execution
+context (host_execute_thunk.cc), and handlers that need one (jaxlib's CPU
+Python callbacks; FFI functions with per-execution user data or state, e.g.
+a user's own registered for "cpu") would fail or crash there. Python
+callbacks in a region use the plugin's own handler instead (_callbacks.py),
+which the library also registers for the host.
+
+An executable deserialized without being lowered in this process
+(``serialize_executable``) finds no handler and fails to load, instead of
+calling LAPACK routines that were never loaded.
 """
 
 from __future__ import annotations
@@ -30,9 +39,8 @@ import threading
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_forwarded: set[str] = set()
+_registered = False
 _register = None
-_STAGES = ("instantiate", "prepare", "initialize", "execute", "record")
 
 _capsule_name = ctypes.pythonapi.PyCapsule_GetName
 _capsule_name.restype = ctypes.c_char_p
@@ -42,52 +50,31 @@ _capsule_pointer.restype = ctypes.c_void_p
 _capsule_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
 
-def _pointer(capsule) -> int:
-  return _capsule_pointer(capsule, _capsule_name(capsule))
-
-
-def _host_targets():
-  """(name, {stage: capsule}) for jaxlib's typed-FFI host handlers."""
-  from jaxlib import xla_client
-  # Registered with jaxlib's XLA (once its CPU backend is up)...
-  for name, stages in xla_client._xla.custom_call_targets("Host").items():
-    yield name, stages
-  # ... or still queued for it (JAX_PLATFORMS without cpu).
-  for name, fn, api_version, _ in list(
-      xla_client._custom_callback.get("Host", ())):
-    if api_version == 1:
-      yield name, fn if isinstance(fn, dict) else {"execute": fn}
-
-
-def sync() -> None:
-  """Hand the library the host handlers it has not been given yet."""
-  if _register is None:
-    return
+def _register_linalg() -> None:
+  """Load LAPACK and hand jaxlib's linear algebra handlers to the library,
+  once."""
+  global _registered
   with _lock:
-    for name, stages in _host_targets():
-      if name in _forwarded:
+    if _registered:
+      return
+    _registered = True
+    from jax._src.lib import lapack
+    lapack._lapack.initialize()
+    for name, capsule, api_version in lapack.registrations()["cpu"]:
+      if api_version != 1:  # not a typed-FFI handler
         continue
-      _forwarded.add(name)
-      if not isinstance(stages, dict) or "execute" not in stages:
-        continue
-      try:
-        ptrs = [_pointer(stages[s]) if s in stages else None for s in _STAGES]
-      except Exception as e:  # not an FFI handler capsule
-        logger.info("not forwarding host FFI target %s: %s", name, e)
-        continue
+      execute = _capsule_pointer(capsule, _capsule_name(capsule))
       error = ctypes.create_string_buffer(1024)
-      rc = _register(name.encode(), *ptrs, error, len(error))
-      if rc < 0:
+      if _register(name.encode(), None, None, None, execute, None, error,
+                   len(error)) < 0:
         logger.warning(
-            "jax_graft: cannot use jaxlib's host FFI handler %s in "
-            "compute_on(\"device_host\") regions: %s", name,
-            error.value.decode(errors="replace"))
+            "jax-graft: cannot use jaxlib's %s in compute_on(\"device_host\") "
+            "regions: %s", name, error.value.decode(errors="replace"))
 
 
 def install(library_path) -> None:
-  """Forward host handlers before every compile (and persistent-cache load:
-  a cached host executable looks its handlers up when it is loaded). Call
-  after the plugin is registered."""
+  """Register jaxlib's linear algebra handlers when a compute_on region is
+  first lowered for mtl. Call after the plugin is registered."""
   global _register
   if _register is not None:
     return
@@ -98,11 +85,17 @@ def install(library_path) -> None:
   fn.restype = ctypes.c_int
   _register = fn
 
-  from jax._src import compiler
-  upstream = compiler.compile_or_get_cached
+  from jax._src import compute_on
+  from jax._src.interpreters import mlir
+  from jax_graft import PLATFORM
+  upstream = mlir._lowerings[compute_on.compute_on_p]
 
-  def compile_or_get_cached(*args, **kwargs):
-    sync()
-    return upstream(*args, **kwargs)
-  compile_or_get_cached.__wrapped__ = upstream
-  compiler.compile_or_get_cached = compile_or_get_cached
+  def lowering(ctx, *args, **params):
+    try:
+      _register_linalg()
+    except Exception as e:  # noqa: BLE001 - the region then fails to compile
+      logger.warning("jax-graft: jaxlib's linear algebra is unavailable in "
+                     "compute_on(\"device_host\") regions: %s", e)
+    return upstream.rule(ctx, *args, **params)
+  mlir.register_lowering(compute_on.compute_on_p, lowering, platform=PLATFORM,
+                         inline=upstream.inline)

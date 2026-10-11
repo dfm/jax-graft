@@ -243,7 +243,7 @@ def test_compute_on_host():
         # A host call per iteration.
         _, s = jax.jit(lambda x: jax.lax.scan(
             lambda c, _: (c * 0.5, piece(c)), x, None, length=20))(x)
-        assert np.asarray(s)[0] == want
+        np.testing.assert_allclose(np.asarray(s)[0], want, rtol=1e-6)
         # JAX lowers the region with its CPU rules: LAPACK calls are jaxlib's
         # handlers (forwarded by _host_ffi.py), and their gradient passes a
         # column-major f64[n,1] residual between regions

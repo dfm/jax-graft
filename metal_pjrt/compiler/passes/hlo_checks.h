@@ -56,7 +56,9 @@ absl::Status CheckPostGemmRewriter(const HloModule& module);
 // (HostComputeAsyncifier), after which pipelines run on
 // {kMainExecutionThread} skip them; before that, this moves them (and
 // everything they call) there while `fn` runs, and back afterwards. Refuses
-// (before running `fn`) a custom call inside one that XLA:CPU cannot run.
+// (before running `fn`) a custom call inside one that XLA:CPU cannot run,
+// a computation that both a region and main-thread code call, and a
+// host-typed op that is not a call (JAX 0.10's legacy compute_on).
 absl::Status WithHostComputeHidden(HloModule* module,
                                    absl::FunctionRef<absl::Status()> fn);
 

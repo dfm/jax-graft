@@ -528,6 +528,65 @@ ENTRY e {
       << status;
 }
 
+// A computation both a host region and main-thread code call would be
+// hidden from the plugin's passes: refused.
+TEST_F(MetalHloChecksTest, ComputationSharedWithHostComputeIsRefused) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+f {
+  p = f32[4] parameter(0)
+  ROOT r = f32[4] negate(p)
+}
+ENTRY e {
+  x = f32[4] parameter(0)
+  h = f32[4] call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+  ROOT d = f32[4] call(h), to_apply=f
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  absl::Status status =
+      WithHostComputeHidden(module->get(), [] { return absl::OkStatus(); });
+  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
+  EXPECT_NE(status.message().find("both inside and outside"),
+            std::string::npos)
+      << status;
+}
+
+// JAX 0.10's legacy compute_on marks single ops: refused, since they
+// cannot be hidden from the plugin's passes. XLA's pass-through annotations
+// in a region, and the call's results (which carry its attributes), are not
+// refused.
+TEST_F(MetalHloChecksTest, HostTypedSingleOpIsRefused) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+ENTRY e {
+  x = f64[4] parameter(0)
+  ROOT n = f64[4] negate(x), frontend_attributes={_xla_compute_type="host"}
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  absl::Status status =
+      WithHostComputeHidden(module->get(), [] { return absl::OkStatus(); });
+  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_NE(status.message().find("compute_type"), std::string::npos)
+      << status;
+
+  auto sharded = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+f {
+  p = f32[4] parameter(0)
+  s = f32[4] custom-call(p), custom_call_target="Sharding", sharding={replicated}
+  ROOT t = (f32[4], f32[4]) tuple(s, s)
+}
+ENTRY e {
+  x = f32[4] parameter(0)
+  c = (f32[4], f32[4]) call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+  ROOT g = f32[4] get-tuple-element(c), index=0, frontend_attributes={_xla_compute_type="host"}
+})");
+  ASSERT_TRUE(sharded.ok()) << sharded.status();
+  EXPECT_TRUE(WithHostComputeHidden(sharded->get(), [] {
+                return absl::OkStatus();
+              }).ok());
+}
+
 // lax.rng_uniform: RngExpander leaves an rng-get-and-update-state, which
 // XLA emits as a legacy LLVM-IR kernel.
 TEST_F(MetalHloChecksTest, RngStateIsRefused) {

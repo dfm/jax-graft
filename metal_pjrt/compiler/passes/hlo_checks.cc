@@ -264,6 +264,14 @@ bool HostCanRun(const HloInstruction& instr) {
       target == "GetRngSeed") {
     return true;
   }
+  // Annotations JAX may emit in a region, which XLA removes on the main
+  // thread before it moves the region to the host (ShardingRemover,
+  // ConvertMemoryPlacementToInternalAnnotations).
+  if (target == "Sharding" || target == "SPMDFullToShardShape" ||
+      target == "SPMDShardToFullShape" ||
+      target == "annotate_device_placement") {
+    return true;
+  }
   if (Cast<HloCustomCallInstruction>(&instr)->api_version() ==
       CustomCallApiVersion::API_VERSION_TYPED_FFI) {
     return ffi::FindHandler(target, "Host").ok();
@@ -296,6 +304,44 @@ absl::Status WithHostComputeHidden(HloModule* module,
       }
     }
   }
+  // Hiding a computation that main-thread code also calls would keep the
+  // plugin's passes from it (JAX lowers a function called both inside and
+  // outside a region twice, so this is not expected). A host-typed op that
+  // is not a call (the legacy `with compute_on(...)` of JAX 0.10 marks each
+  // op) cannot be hidden, and the plugin's passes could rewrite it into a
+  // metal$ call that XLA:CPU then cannot compile.
+  for (HloComputation* comp : module->computations()) {
+    if (seen.contains(comp)) continue;
+    for (HloInstruction* instr : comp->instructions()) {
+      const auto& attributes = instr->frontend_attributes().map();
+      auto type = attributes.find("_xla_compute_type");
+      if (type != attributes.end() && type->second == "host") {
+        // The region's call, and the results taken from it (the HLO import
+        // copies the call's attributes onto them).
+        if (instr->opcode() == HloOpcode::kCall ||
+            (instr->opcode() == HloOpcode::kGetTupleElement &&
+             instr->operand(0)->opcode() == HloOpcode::kCall)) {
+          continue;
+        }
+        return absl::UnimplementedError(absl::StrCat(
+            "Metal: this form of compute_on(\"device_host\") is not "
+            "supported (it marks single ops); use "
+            "jax.experimental.compute_on.compute_on(f, "
+            "compute_type=\"device_host\", out_memory_spaces=...) "
+            "(JAX 0.11 or later): ",
+            DescribeOp(*instr)));
+      }
+      for (HloComputation* called : instr->called_computations()) {
+        if (seen.contains(called)) {
+          return absl::InternalError(absl::StrCat(
+              "Metal: computation ", called->name(),
+              " is called both inside and outside a "
+              "compute_on(\"device_host\") region: ",
+              DescribeOp(*instr), metal_pjrt::kReportBug));
+        }
+      }
+    }
+  }
   // XLA CHECK-fails (aborts the process) when XLA:CPU cannot compile a host
   // region, e.g. on a custom call it has no handler for.
   for (HloComputation* comp : hidden) {
@@ -310,6 +356,8 @@ absl::Status WithHostComputeHidden(HloModule* module,
       }
     }
   }
+  // While hidden, a main-thread call reaches a host-thread computation,
+  // which HloVerifier rejects; `fn` must not run it.
   for (HloComputation* comp : hidden) {
     comp->SetExecutionThread(HloInstruction::kHostThread);
   }

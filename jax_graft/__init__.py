@@ -279,11 +279,10 @@ def initialize():
         _callbacks.install(path)
     except Exception as e:  # noqa: BLE001 - never break plugin init
         logger.warning("jax-graft: host callbacks unavailable: %s", e)
-    # jaxlib's CPU FFI handlers (LAPACK, ...) in compute_on("device_host")
-    # regions.
+    # jaxlib's linear algebra in compute_on("device_host") regions.
     try:
         from jax_graft import _host_ffi
         _host_ffi.install(path)
     except Exception as e:  # noqa: BLE001 - never break plugin init
-        logger.warning("jax-graft: jaxlib's CPU handlers unavailable in "
+        logger.warning("jax-graft: jaxlib's linear algebra unavailable in "
                        "compute_on(\"device_host\") regions: %s", e)

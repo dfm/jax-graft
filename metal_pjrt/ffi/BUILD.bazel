@@ -10,8 +10,9 @@ package(default_visibility = ["//visibility:public"])
 # metal$conv, metal$pool_max_bwd),
 # the FFT handler the Python fft lowering targets (metal$fft),
 # XLA's SortRewriter targets (xla.gpu.ext.cub_sort_keys/pairs), the Python
-# callback handler, and the export that registers jaxlib's CPU handlers for
-# compute_on("device_host") regions (host_ffi.cc). Handlers register statically, so this is alwayslink.
+# callback handler, and the export that registers jaxlib's CPU handlers
+# for compute_on("device_host") regions (host_ffi.cc). Handlers register
+# statically, so this is alwayslink.
 cc_library(
     name = "metal_ffi",
     srcs = [
