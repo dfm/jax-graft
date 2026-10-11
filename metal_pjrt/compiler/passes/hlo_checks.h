@@ -43,6 +43,8 @@ std::string DescribeOp(const HloInstruction& instr);
 //  - every cuBLASLt GEMM is a plain "__cublas$lt$matmul" whose element types,
 //    epilogue and (for f16/bf16, steel only) shape MetalBlasLt supports
 //    (blas_lt_support.h).
+//  - no async op in a host-offloaded (host-thread) computation: XLA:CPU
+//    cannot compile one, and XLA aborts when that compile fails.
 // Returns an error naming the first offending op, so a violation fails at
 // compile time instead of at run time or with wrong values.
 absl::Status CheckPostGemmRewriter(const HloModule& module);
@@ -55,10 +57,13 @@ absl::Status CheckPostGemmRewriter(const HloModule& module);
 // compute in f64). XLA moves them to the host execution thread itself
 // (HostComputeAsyncifier), after which pipelines run on
 // {kMainExecutionThread} skip them; before that, this moves them (and
-// everything they call) there while `fn` runs, and back afterwards. Refuses
+// everything they call) there while `fn` runs, and back afterwards. When
+// there is a region, first gives every computation one caller
+// (FlattenCallGraph; XLA would nest a region inside it otherwise). Refuses
 // (before running `fn`) a custom call inside one that XLA:CPU cannot run,
-// a computation that both a region and main-thread code call, and a
-// host-typed op that is not a call (JAX 0.10's legacy compute_on).
+// and a host-typed op that is not a call (JAX 0.10's legacy compute_on). Drops
+// the host marks JAX puts on the ops inside a region (XLA would offload
+// them again, nested, which XLA:CPU cannot compile).
 absl::Status WithHostComputeHidden(HloModule* module,
                                    absl::FunctionRef<absl::Status()> fn);
 

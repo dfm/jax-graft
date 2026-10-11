@@ -25,6 +25,7 @@
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_module_metadata.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/transforms/simplifiers/flatten_call_graph.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/matmul_utils.h"
@@ -283,6 +284,26 @@ bool HostCanRun(const HloInstruction& instr) {
 
 absl::Status WithHostComputeHidden(HloModule* module,
                                    absl::FunctionRef<absl::Status()> fn) {
+  // One caller per computation, as XLA's pre-SPMD FlattenCallGraph leaves it
+  // later, but before HloHostDeviceTypeCallWrapper: that pass marks every op
+  // of a region host-typed, then skips a computation only if its single
+  // caller is host-typed. A reducer, comparator or helper called twice in a
+  // region (two sorts, jax.random twice) would have its marked ops offloaded
+  // again, as an async region nested in the region, which XLA:CPU cannot
+  // compile (a process abort).
+  if (absl::c_any_of(
+          module->computations({HloInstruction::kMainExecutionThread}),
+          [](const HloComputation* comp) {
+            return absl::c_any_of(
+                comp->instructions(), [](const HloInstruction* instr) {
+                  auto it = instr->frontend_attributes().map().find(
+                      "_xla_compute_type");
+                  return it != instr->frontend_attributes().map().end() &&
+                         it->second == "host";
+                });
+          })) {
+    TF_RETURN_IF_ERROR(FlattenCallGraph().Run(module).status());
+  }
   std::vector<HloComputation*> hidden;
   absl::flat_hash_set<HloComputation*> seen;
   for (HloComputation* comp :
@@ -304,42 +325,29 @@ absl::Status WithHostComputeHidden(HloModule* module,
       }
     }
   }
-  // Hiding a computation that main-thread code also calls would keep the
-  // plugin's passes from it (JAX lowers a function called both inside and
-  // outside a region twice, so this is not expected). A host-typed op that
-  // is not a call (the legacy `with compute_on(...)` of JAX 0.10 marks each
-  // op) cannot be hidden, and the plugin's passes could rewrite it into a
-  // metal$ call that XLA:CPU then cannot compile.
+  // A host-typed op that is not a call (the legacy `with compute_on(...)` of
+  // JAX 0.10 marks each op) cannot be hidden, and the plugin's passes could
+  // rewrite it into a metal$ call that XLA:CPU then cannot compile.
   for (HloComputation* comp : module->computations()) {
     if (seen.contains(comp)) continue;
     for (HloInstruction* instr : comp->instructions()) {
       const auto& attributes = instr->frontend_attributes().map();
       auto type = attributes.find("_xla_compute_type");
-      if (type != attributes.end() && type->second == "host") {
-        // The region's call, and the results taken from it (the HLO import
-        // copies the call's attributes onto them).
-        if (instr->opcode() == HloOpcode::kCall ||
-            (instr->opcode() == HloOpcode::kGetTupleElement &&
-             instr->operand(0)->opcode() == HloOpcode::kCall)) {
-          continue;
-        }
-        return absl::UnimplementedError(absl::StrCat(
-            "Metal: this form of compute_on(\"device_host\") is not "
-            "supported (it marks single ops); use "
-            "jax.experimental.compute_on.compute_on(f, "
-            "compute_type=\"device_host\", out_memory_spaces=...) "
-            "(JAX 0.11 or later): ",
-            DescribeOp(*instr)));
+      if (type == attributes.end() || type->second != "host") continue;
+      // The region's call, and the results taken from it (the HLO import
+      // copies the call's attributes onto them).
+      if (instr->opcode() == HloOpcode::kCall ||
+          (instr->opcode() == HloOpcode::kGetTupleElement &&
+           instr->operand(0)->opcode() == HloOpcode::kCall)) {
+        continue;
       }
-      for (HloComputation* called : instr->called_computations()) {
-        if (seen.contains(called)) {
-          return absl::InternalError(absl::StrCat(
-              "Metal: computation ", called->name(),
-              " is called both inside and outside a "
-              "compute_on(\"device_host\") region: ",
-              DescribeOp(*instr), metal_pjrt::kReportBug));
-        }
-      }
+      return absl::UnimplementedError(absl::StrCat(
+          "Metal: this form of compute_on(\"device_host\") is not "
+          "supported (it marks single ops); use "
+          "jax.experimental.compute_on.compute_on(f, "
+          "compute_type=\"device_host\", out_memory_spaces=...) "
+          "(JAX 0.11 or later): ",
+          DescribeOp(*instr)));
     }
   }
   // XLA CHECK-fails (aborts the process) when XLA:CPU cannot compile a host
@@ -356,6 +364,16 @@ absl::Status WithHostComputeHidden(HloModule* module,
       }
     }
   }
+  // JAX marks every op of a region host-typed, and XLA would offload each
+  // marked op inside it again (HloHostDeviceTypeCallWrapper,
+  // HostComputeAsyncifier), as an async region nested in the region, which
+  // XLA:CPU cannot compile (a process abort). The region's own call is what
+  // carries the offload; the marks inside it are dropped.
+  for (HloComputation* comp : hidden) {
+    for (HloInstruction* instr : comp->instructions()) {
+      instr->erase_frontend_attribute("_xla_compute_type");
+    }
+  }
   // While hidden, a main-thread call reaches a host-thread computation,
   // which HloVerifier rejects; `fn` must not run it.
   for (HloComputation* comp : hidden) {
@@ -369,6 +387,21 @@ absl::Status WithHostComputeHidden(HloModule* module,
 }
 
 absl::Status CheckPostGemmRewriter(const HloModule& module) {
+  // An async op inside a host-offloaded region (a region nested in it)
+  // would make XLA:CPU's compile fail, which aborts the process.
+  for (const HloComputation* comp : module.computations()) {
+    if (comp->execution_thread() != HloInstruction::kHostThread) continue;
+    for (const HloInstruction* instr : comp->instructions()) {
+      if (instr->opcode() == HloOpcode::kAsyncStart ||
+          instr->opcode() == HloOpcode::kAsyncUpdate ||
+          instr->opcode() == HloOpcode::kAsyncDone) {
+        return absl::InternalError(absl::StrCat(
+            "Metal: an async op inside a compute_on(\"device_host\") "
+            "region: ",
+            DescribeOp(*instr), metal_pjrt::kReportBug));
+      }
+    }
+  }
   // Host-offloaded computations run on the CPU (see WithHostComputeHidden).
   for (const HloComputation* comp :
        module.computations({HloInstruction::kMainExecutionThread})) {

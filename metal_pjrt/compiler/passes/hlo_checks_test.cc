@@ -528,9 +528,9 @@ ENTRY e {
       << status;
 }
 
-// A computation both a host region and main-thread code call would be
-// hidden from the plugin's passes: refused.
-TEST_F(MetalHloChecksTest, ComputationSharedWithHostComputeIsRefused) {
+// A computation both a host region and main-thread code call gets a copy
+// for each, so hiding the region's keeps the main one in the plugin's passes.
+TEST_F(MetalHloChecksTest, ComputationSharedWithHostComputeIsCloned) {
   auto module = ParseAndReturnUnverifiedModule(R"(
 HloModule m
 f {
@@ -543,12 +543,20 @@ ENTRY e {
   ROOT d = f32[4] call(h), to_apply=f
 })");
   ASSERT_TRUE(module.ok()) << module.status();
-  absl::Status status =
-      WithHostComputeHidden(module->get(), [] { return absl::OkStatus(); });
-  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
-  EXPECT_NE(status.message().find("both inside and outside"),
-            std::string::npos)
-      << status;
+  HloModule* m = module->get();
+  std::vector<std::string> main;
+  absl::Status status = WithHostComputeHidden(m, [&] {
+    for (HloComputation* comp :
+         m->computations({HloInstruction::kMainExecutionThread})) {
+      main.emplace_back(comp->name());
+    }
+    return absl::OkStatus();
+  });
+  ASSERT_TRUE(status.ok()) << status;
+  // The entry and the main call's copy of f; the region's copy is hidden.
+  EXPECT_EQ(main.size(), 2);
+  EXPECT_NE(m->entry_computation()->root_instruction()->to_apply(),
+            m->entry_computation()->root_instruction()->operand(0)->to_apply());
 }
 
 // JAX 0.10's legacy compute_on marks single ops: refused, since they
@@ -585,6 +593,106 @@ ENTRY e {
   EXPECT_TRUE(WithHostComputeHidden(sharded->get(), [] {
                 return absl::OkStatus();
               }).ok());
+}
+
+// JAX marks every op inside a region; XLA would offload the marked ones
+// again as nested async regions XLA:CPU cannot compile. The marks inside
+// are dropped; the region's call keeps its own.
+TEST_F(MetalHloChecksTest, HostMarksInsideRegionAreDropped) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+cond {
+  c = (s32[], f64[4]) parameter(0)
+  i = s32[] get-tuple-element(c), index=0, frontend_attributes={_xla_compute_type="host"}
+  n = s32[] constant(3)
+  ROOT lt = pred[] compare(i, n), direction=LT, frontend_attributes={_xla_compute_type="host"}
+}
+body {
+  b = (s32[], f64[4]) parameter(0)
+  i = s32[] get-tuple-element(b), index=0
+  x = f64[4] get-tuple-element(b), index=1
+  one = s32[] constant(1)
+  j = s32[] add(i, one), frontend_attributes={_xla_compute_type="host"}
+  y = f64[4] negate(x), frontend_attributes={_xla_compute_type="host"}
+  ROOT t = (s32[], f64[4]) tuple(j, y)
+}
+f {
+  p = f64[4] parameter(0)
+  z = s32[] constant(0)
+  t = (s32[], f64[4]) tuple(z, p)
+  w = (s32[], f64[4]) while(t), condition=cond, body=body, frontend_attributes={_xla_compute_type="host"}
+  ROOT r = f64[4] get-tuple-element(w), index=1
+}
+ENTRY e {
+  x = f64[4] parameter(0)
+  ROOT c = f64[4] call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  HloModule* m = module->get();
+  ASSERT_TRUE(
+      WithHostComputeHidden(m, [] { return absl::OkStatus(); }).ok());
+  for (const char* name : {"f", "cond", "body"}) {
+    for (const HloInstruction* instr :
+         m->GetComputationWithName(name)->instructions()) {
+      EXPECT_FALSE(instr->frontend_attributes().map().contains(
+          "_xla_compute_type"))
+          << instr->name();
+    }
+  }
+  EXPECT_TRUE(m->entry_computation()->root_instruction()
+                  ->frontend_attributes().map().contains("_xla_compute_type"));
+}
+
+// An async op left inside a host-thread computation is refused, not
+// handed to XLA:CPU (which would abort).
+TEST_F(MetalHloChecksTest, AsyncInHostComputationIsRefused) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+inner {
+  q = f32[4] parameter(0)
+  ROOT n = f32[4] negate(q)
+}, execution_thread="host"
+f {
+  p = f32[4] parameter(0)
+  s = ((f32[4]), f32[4], u32[]) async-start(p), async_execution_thread="host", calls=inner
+  ROOT d = f32[4] async-done(s)
+}, execution_thread="host"
+ENTRY e {
+  ROOT x = f32[4] parameter(0)
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  absl::Status status = CheckPostGemmRewriter(**module);
+  EXPECT_EQ(status.code(), absl::StatusCode::kInternal) << status;
+}
+
+// A reducer two reduces in a region share gets one copy per caller, so
+// XLA's host-call wrapper does not offload its ops again (nested).
+TEST_F(MetalHloChecksTest, SharedComputationInRegionIsCloned) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+add {
+  a = f64[] parameter(0)
+  b = f64[] parameter(1)
+  ROOT s = f64[] add(a, b)
+}
+f {
+  p = f64[4] parameter(0)
+  z = f64[] constant(0)
+  r1 = f64[] reduce(p, z), dimensions={0}, to_apply=add
+  r2 = f64[] reduce(p, z), dimensions={0}, to_apply=add
+  ROOT t = f64[] add(r1, r2)
+}
+ENTRY e {
+  x = f64[4] parameter(0)
+  ROOT c = f64[] call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  HloModule* m = module->get();
+  ASSERT_TRUE(
+      WithHostComputeHidden(m, [] { return absl::OkStatus(); }).ok());
+  for (const HloComputation* comp : m->computations()) {
+    EXPECT_LE(comp->caller_instructions().size(), 1) << comp->name();
+  }
 }
 
 // lax.rng_uniform: RngExpander leaves an rng-get-and-update-state, which

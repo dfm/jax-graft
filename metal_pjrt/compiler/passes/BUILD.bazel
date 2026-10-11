@@ -264,6 +264,7 @@ cc_library(
         "@xla//xla:xla_data_proto_cc",
         "@xla//xla/ffi:ffi_registry",
         "@xla//xla/hlo/ir:hlo",
+        "@xla//xla/hlo/transforms/simplifiers:flatten_call_graph",
         "@xla//xla/service:custom_call_target_registry",
         "@xla//xla/service/gpu:backend_configs_cc",
         "@xla//xla/service/gpu:cublas_cudnn",
