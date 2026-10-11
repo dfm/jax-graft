@@ -10,7 +10,6 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -282,79 +281,58 @@ bool HostCanRun(const HloInstruction& instr) {
 
 }  // namespace
 
-absl::Status WithHostComputeHidden(HloModule* module,
-                                   absl::FunctionRef<absl::Status()> fn) {
-  // One caller per computation, as XLA's pre-SPMD FlattenCallGraph leaves it
-  // later, but before HloHostDeviceTypeCallWrapper: that pass marks every op
-  // of a region host-typed, then skips a computation only if its single
-  // caller is host-typed. A reducer, comparator or helper called twice in a
-  // region (two sorts, jax.random twice) would have its marked ops offloaded
-  // again, as an async region nested in the region, which XLA:CPU cannot
-  // compile (a process abort).
-  if (absl::c_any_of(
-          module->computations({HloInstruction::kMainExecutionThread}),
-          [](const HloComputation* comp) {
-            return absl::c_any_of(
-                comp->instructions(), [](const HloInstruction* instr) {
-                  auto it = instr->frontend_attributes().map().find(
-                      "_xla_compute_type");
-                  return it != instr->frontend_attributes().map().end() &&
-                         it->second == "host";
-                });
-          })) {
-    TF_RETURN_IF_ERROR(FlattenCallGraph().Run(module).status());
+absl::StatusOr<HostComputeHidden> HostComputeHidden::Hide(
+    HloModule* module) {
+  HostComputeHidden result;
+  auto host_typed = [](const HloInstruction* instr) {
+    // kXlaComputeTypeAttr / kXlaComputeTypeHost (xla/side_effect_util.h).
+    auto it = instr->frontend_attributes().map().find("_xla_compute_type");
+    return it != instr->frontend_attributes().map().end() &&
+           it->second == "host";
+  };
+  if (!absl::c_any_of(module->computations(), [&](const HloComputation* c) {
+        return absl::c_any_of(c->instructions(), host_typed);
+      })) {
+    return result;
   }
-  std::vector<HloComputation*> hidden;
+  TF_RETURN_IF_ERROR(FlattenCallGraph().Run(module).status());
+
   absl::flat_hash_set<HloComputation*> seen;
-  for (HloComputation* comp :
-       module->computations({HloInstruction::kMainExecutionThread})) {
-    for (HloInstruction* instr : comp->instructions()) {
-      // kXlaComputeTypeAttr / kXlaComputeTypeHost (xla/side_effect_util.h).
-      const auto& attributes = instr->frontend_attributes().map();
-      auto type = attributes.find("_xla_compute_type");
-      if (type == attributes.end() || type->second != "host") continue;
-      for (HloComputation* called : instr->called_computations()) {
-        if (seen.insert(called).second) hidden.push_back(called);
-      }
-    }
-  }
-  for (size_t i = 0; i < hidden.size(); ++i) {
-    for (HloInstruction* instr : hidden[i]->instructions()) {
-      for (HloComputation* called : instr->called_computations()) {
-        if (seen.insert(called).second) hidden.push_back(called);
-      }
-    }
-  }
-  // A host-typed op that is not a call (the legacy `with compute_on(...)` of
-  // JAX 0.10 marks each op) cannot be hidden, and the plugin's passes could
-  // rewrite it into a metal$ call that XLA:CPU then cannot compile.
   for (HloComputation* comp : module->computations()) {
-    if (seen.contains(comp)) continue;
     for (HloInstruction* instr : comp->instructions()) {
-      const auto& attributes = instr->frontend_attributes().map();
-      auto type = attributes.find("_xla_compute_type");
-      if (type == attributes.end() || type->second != "host") continue;
-      // The region's call, and the results taken from it (the HLO import
-      // copies the call's attributes onto them).
-      if (instr->opcode() == HloOpcode::kCall ||
-          (instr->opcode() == HloOpcode::kGetTupleElement &&
-           instr->operand(0)->opcode() == HloOpcode::kCall)) {
-        continue;
+      if (!host_typed(instr)) continue;
+      for (HloComputation* called : instr->called_computations()) {
+        if (seen.insert(called).second) result.hidden_.push_back(called);
       }
-      return absl::UnimplementedError(absl::StrCat(
-          "Metal: this form of compute_on(\"device_host\") is not "
-          "supported (it marks single ops); use "
-          "jax.experimental.compute_on.compute_on(f, "
-          "compute_type=\"device_host\", out_memory_spaces=...) "
-          "(JAX 0.11 or later): ",
-          DescribeOp(*instr)));
     }
   }
-  // XLA CHECK-fails (aborts the process) when XLA:CPU cannot compile a host
-  // region, e.g. on a custom call it has no handler for.
-  for (HloComputation* comp : hidden) {
+  for (size_t i = 0; i < result.hidden_.size(); ++i) {
+    for (HloInstruction* instr : result.hidden_[i]->instructions()) {
+      for (HloComputation* called : instr->called_computations()) {
+        if (seen.insert(called).second) result.hidden_.push_back(called);
+      }
+    }
+  }
+  for (HloComputation* comp : module->computations()) {
+    const bool in_region = seen.contains(comp);
     for (HloInstruction* instr : comp->instructions()) {
-      if (instr->opcode() == HloOpcode::kCustomCall && !HostCanRun(*instr)) {
+      // Outside a region, only the region's call and the results taken from
+      // it (the HLO import copies its attributes onto them) may be marked:
+      // a single marked op (JAX 0.10's legacy compute_on) cannot be hidden.
+      if (!in_region && host_typed(instr) &&
+          instr->opcode() != HloOpcode::kCall &&
+          !(instr->opcode() == HloOpcode::kGetTupleElement &&
+            instr->operand(0)->opcode() == HloOpcode::kCall)) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Metal: this form of compute_on(\"device_host\") is not "
+            "supported (it marks single ops); use "
+            "jax.experimental.compute_on.compute_on(f, "
+            "compute_type=\"device_host\", out_memory_spaces=...) "
+            "(JAX 0.11 or later): ",
+            DescribeOp(*instr)));
+      }
+      if (in_region && instr->opcode() == HloOpcode::kCustomCall &&
+          !HostCanRun(*instr)) {
         return absl::UnimplementedError(absl::StrCat(
             "Metal: ", instr->custom_call_target(),
             " inside jax.experimental.compute_on(\"device_host\") is not "
@@ -364,26 +342,19 @@ absl::Status WithHostComputeHidden(HloModule* module,
       }
     }
   }
-  // JAX marks every op of a region host-typed, and XLA would offload each
-  // marked op inside it again (HloHostDeviceTypeCallWrapper,
-  // HostComputeAsyncifier), as an async region nested in the region, which
-  // XLA:CPU cannot compile (a process abort). The region's own call is what
-  // carries the offload; the marks inside it are dropped.
-  for (HloComputation* comp : hidden) {
-    for (HloInstruction* instr : comp->instructions()) {
-      instr->erase_frontend_attribute("_xla_compute_type");
-    }
-  }
   // While hidden, a main-thread call reaches a host-thread computation,
-  // which HloVerifier rejects; `fn` must not run it.
-  for (HloComputation* comp : hidden) {
+  // which HloVerifier rejects; no pipeline in between may run it.
+  for (HloComputation* comp : result.hidden_) {
     comp->SetExecutionThread(HloInstruction::kHostThread);
   }
-  absl::Status status = fn();
-  for (HloComputation* comp : hidden) {
+  return result;
+}
+
+void HostComputeHidden::Restore() {
+  for (HloComputation* comp : hidden_) {
     comp->SetExecutionThread(HloInstruction::kMainExecutionThread);
   }
-  return status;
+  hidden_.clear();
 }
 
 absl::Status CheckPostGemmRewriter(const HloModule& module) {
@@ -402,7 +373,7 @@ absl::Status CheckPostGemmRewriter(const HloModule& module) {
       }
     }
   }
-  // Host-offloaded computations run on the CPU (see WithHostComputeHidden).
+  // Host-offloaded computations run on the CPU (see HostComputeHidden).
   for (const HloComputation* comp :
        module.computations({HloInstruction::kMainExecutionThread})) {
     for (const HloInstruction* instr : comp->instructions()) {

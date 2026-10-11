@@ -375,12 +375,10 @@ extern "C" PJRT_CAPI_EXPORT const PJRT_Api* GetPjrtApi() {
 //   (metal_pjrt/ffi/python_callback_ffi.cc), whose handler is also
 //   registered for the host (compute_on("device_host") regions);
 // - metal_pjrt_register_host_ffi_handler, with which the frontend registers
-//   jaxlib's linear algebra FFI handlers (stateless; XLA runs regions
-//   without an execution context) for those regions, after jaxlib has
-//   loaded LAPACK; the library keeps the pointers, so jaxlib stays loaded
-//   (metal_pjrt/ffi/host_ffi.cc, jax_graft/_host_ffi.py). The host callback
-//   handler skips the stream sync because XLA runs a region once its
-//   operands are ready;
+//   jaxlib's stateless linear algebra handlers for those regions, after
+//   jaxlib has loaded LAPACK (metal_pjrt/ffi/host_ffi.cc,
+//   jax_graft/_host_ffi.py); the library keeps the pointers, so jaxlib stays
+//   loaded;
 // - the environment variables both sides act on (METAL_PJRT_DISABLE_LAPACK,
 //   METAL_PJRT_DISABLE_FFT, which the library also puts in the cache key)
 //   and their boolean parsing (EnvFlag in runtime/env.h, _env_flag);

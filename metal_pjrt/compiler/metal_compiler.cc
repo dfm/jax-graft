@@ -66,7 +66,7 @@ namespace gpu {
 namespace {
 
 // The plugin's pipelines run where XLA's own do: the main execution thread,
-// never host-offloaded computations (see WithHostComputeHidden).
+// never host-offloaded computations (see HostComputeHidden).
 const absl::flat_hash_set<absl::string_view> kMain = {
     HloInstruction::kMainExecutionThread};
 
@@ -209,69 +209,69 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
     const CompileOptions& options) {
   ApplyMetalDefaults(module->mutable_config().mutable_debug_options());
   // Host-offloaded regions (compute_on("device_host")) run on the CPU and
-  // keep their ops; see WithHostComputeHidden.
-  TF_RETURN_IF_ERROR(WithHostComputeHidden(module.get(), [&]() -> absl::Status {
-    {
-      // Complex64 dots become real f32 dots (MetalBlasLt has no complex GEMM),
-      // before the simplifier and GemmRewriter see them.
-      HloPassPipeline pipeline("metal-complex-dots");
-      pipeline.AddPass<MetalComplexDotExpander>();
-      TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
-    }
-    // --- begin linalg (Accelerate LAPACK) ---
-    // kCholesky / kTriangularSolve -> metal$cholesky / metal$triangular_solve,
-    // before CholeskyExpander / TriangularSolveExpander see them.
-    if (!LapackDisabled()) {
-      HloPassPipeline pipeline("metal-linalg");
-      pipeline.AddPass<MetalLinalgRewriter>();
-      TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
-    }
-    // --- end linalg ---
-    if (Settings().scan_rewrite || Settings().pool_rewrite) {
-      // Before GpuCompiler's ReduceWindowRewriter / SelectAndScatterExpander.
-      HloPassPipeline pipeline("metal-pre-optimization");
-      if (Settings().scan_rewrite) pipeline.AddPass<MetalScanRewriter>();
-      if (Settings().pool_rewrite) pipeline.AddPass<MetalPoolMaxBwdRewriter>();
-      TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
-    }
-    // Every sort ends up stable whatever its is_stable flag: SortRewriter's
-    // radix sort is stable, and MetalSortExpander breaks ties on the original
-    // index. On a key-only sort the flag only makes StableSortExpander add an
-    // iota operand (and tie-break) that the bitonic network then carries next
-    // to its own index.
-    for (HloComputation* computation : module->computations(kMain)) {
-      for (HloInstruction* instr : computation->instructions()) {
-        if (instr->opcode() == HloOpcode::kSort && instr->operand_count() == 1) {
-          Cast<HloSortInstruction>(instr)->set_is_stable(false);
-        }
+  // keep their ops: hidden from the plugin's pipelines below.
+  TF_ASSIGN_OR_RETURN(HostComputeHidden host_compute,
+                      HostComputeHidden::Hide(module.get()));
+  {
+    // Complex64 dots become real f32 dots (MetalBlasLt has no complex GEMM),
+    // before the simplifier and GemmRewriter see them.
+    HloPassPipeline pipeline("metal-complex-dots");
+    pipeline.AddPass<MetalComplexDotExpander>();
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
+  }
+  // --- begin linalg (Accelerate LAPACK) ---
+  // kCholesky / kTriangularSolve -> metal$cholesky / metal$triangular_solve,
+  // before CholeskyExpander / TriangularSolveExpander see them.
+  if (!LapackDisabled()) {
+    HloPassPipeline pipeline("metal-linalg");
+    pipeline.AddPass<MetalLinalgRewriter>();
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
+  }
+  // --- end linalg ---
+  if (Settings().scan_rewrite || Settings().pool_rewrite) {
+    // Before GpuCompiler's ReduceWindowRewriter / SelectAndScatterExpander.
+    HloPassPipeline pipeline("metal-pre-optimization");
+    if (Settings().scan_rewrite) pipeline.AddPass<MetalScanRewriter>();
+    if (Settings().pool_rewrite) pipeline.AddPass<MetalPoolMaxBwdRewriter>();
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
+  }
+  // Every sort ends up stable whatever its is_stable flag: SortRewriter's
+  // radix sort is stable, and MetalSortExpander breaks ties on the original
+  // index. On a key-only sort the flag only makes StableSortExpander add an
+  // iota operand (and tie-break) that the bitonic network then carries next
+  // to its own index.
+  for (HloComputation* computation : module->computations(kMain)) {
+    for (HloInstruction* instr : computation->instructions()) {
+      if (instr->opcode() == HloOpcode::kSort && instr->operand_count() == 1) {
+        Cast<HloSortInstruction>(instr)->set_is_stable(false);
       }
     }
-    if (Settings().cub_sort) {
-      // SortRewriter (enabled in ApplyMetalDefaults) takes every simple sort of
-      // more than 16384 elements (sort_rewriter.cc, non-CUDA default), however
-      // short its rows. Rows of <= 64 stay with the straight-line bitonic
-      // network: it measured 3-180x faster there than the radix sort's one
-      // threadgroup per row (docs/performance.md). Smaller sorts are left
-      // alone here and expanded later, as before.
-      // top_k is still a kTopK here; XLA turns it into a sort later (TopkDecomposer
-      // and TopkRewriter in the pre-SPMD pipeline), which SortRewriter would then
-      // take. Decompose the same short-row ones now so they stay bitonic too
-      // (radix measured ~40x slower on top_k of f32[4096,8]).
-      HloPassPipeline pipeline("metal-small-sorts");
-      constexpr int64_t kCubSortMinElements = 16384;  // sort_rewriter.cc
-      pipeline.AddPass<TopkDecomposer>([](const HloInstruction* instr) {
-        if (instr->opcode() != HloOpcode::kTopK) return false;
-        const Shape& shape = instr->operand(0)->shape();
-        return shape.dimensions(shape.dimensions().size() - 1) <=
-                   kMaxUnrolledSortDim &&
-               ShapeUtil::ElementsIn(shape) > kCubSortMinElements;
-      });
-      pipeline.AddPass<MetalSortExpander>(kMaxUnrolledSortDim,
-                                          kCubSortMinElements);
-      TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
-    }
-    return absl::OkStatus();
-  }));
+  }
+  if (Settings().cub_sort) {
+    // SortRewriter (enabled in ApplyMetalDefaults) takes every simple sort of
+    // more than 16384 elements (sort_rewriter.cc, non-CUDA default), however
+    // short its rows. Rows of <= 64 stay with the straight-line bitonic
+    // network: it measured 3-180x faster there than the radix sort's one
+    // threadgroup per row (docs/performance.md). Smaller sorts are left
+    // alone here and expanded later, as before.
+    // top_k is still a kTopK here; XLA turns it into a sort later (TopkDecomposer
+    // and TopkRewriter in the pre-SPMD pipeline), which SortRewriter would then
+    // take. Decompose the same short-row ones now so they stay bitonic too
+    // (radix measured ~40x slower on top_k of f32[4096,8]).
+    HloPassPipeline pipeline("metal-small-sorts");
+    constexpr int64_t kCubSortMinElements = 16384;  // sort_rewriter.cc
+    pipeline.AddPass<TopkDecomposer>([](const HloInstruction* instr) {
+      if (instr->opcode() != HloOpcode::kTopK) return false;
+      const Shape& shape = instr->operand(0)->shape();
+      return shape.dimensions(shape.dimensions().size() - 1) <=
+                 kMaxUnrolledSortDim &&
+             ShapeUtil::ElementsIn(shape) > kCubSortMinElements;
+    });
+    pipeline.AddPass<MetalSortExpander>(kMaxUnrolledSortDim,
+                                        kCubSortMinElements);
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
+  }
+  host_compute.Restore();
   return GpuCompiler::RunHloPasses(std::move(module), stream_exec, options);
 }
 

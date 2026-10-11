@@ -3,30 +3,19 @@
 
 """jaxlib's CPU linear algebra in ``compute_on("device_host")`` regions.
 
-Such a region runs on the CPU: XLA compiles it with XLA:CPU inside the
-plugin's library, and JAX lowers it with its CPU rules, so a Cholesky in it
-calls jaxlib's ``lapack_dpotrf_ffi`` (and so on), whose handlers jaxlib
-registers with its own copy of XLA, which the plugin's copy cannot see. The
-XLA FFI is a C ABI meant to cross copies of XLA (XLA checks the handler's FFI
-API version when it is registered), so the first time a region is lowered for
-mtl this hands jaxlib's linear algebra handlers
-(``jax._src.lib.lapack.registrations()``: LAPACK and the perturbed
-tridiagonal solve, all stateless) to the library
-(``metal_pjrt_register_host_ffi_handler``, metal_pjrt/ffi/host_ffi.cc), after
-``initialize()`` has loaded the LAPACK routines they call. A handler the
-library cannot take is logged, and a region calling it fails to compile with
-an error naming it.
+JAX lowers such a region with its CPU rules, so a Cholesky in it calls
+jaxlib's ``lapack_dpotrf_ffi``, which jaxlib registers with its own copy of
+XLA, not the library's. The XLA FFI is a C ABI meant to cross copies of XLA,
+so the first time a region is lowered for mtl this loads LAPACK
+(``initialize()``) and hands jaxlib's linear algebra handlers (all stateless)
+to the library (``metal_pjrt_register_host_ffi_handler``).
 
-Nothing else of jaxlib's is forwarded. XLA runs a region without an execution
-context (host_execute_thunk.cc), and handlers that need one (jaxlib's CPU
-Python callbacks; FFI functions with per-execution user data or state, e.g.
-a user's own registered for "cpu") would fail or crash there. Python
-callbacks in a region use the plugin's own handler instead (_callbacks.py),
-which the library also registers for the host.
-
-An executable deserialized without being lowered in this process
-(``serialize_executable``) finds no handler and fails to load, instead of
-calling LAPACK routines that were never loaded.
+Nothing else is forwarded: XLA runs a region without an execution context,
+where handlers with per-execution user data or state (jaxlib's CPU
+callbacks, a user's own "cpu" FFI functions) would fail or crash; they are
+refused at compile time. Python callbacks use the plugin's own handler
+(_callbacks.py). A deserialized executable that was never lowered in this
+process finds no handler and fails to load.
 """
 
 from __future__ import annotations
@@ -65,8 +54,7 @@ def _register_linalg() -> None:
         continue
       execute = _capsule_pointer(capsule, _capsule_name(capsule))
       error = ctypes.create_string_buffer(1024)
-      if _register(name.encode(), None, None, None, execute, None, error,
-                   len(error)) < 0:
+      if _register(name.encode(), execute, error, len(error)) < 0:
         logger.warning(
             "jax-graft: cannot use jaxlib's %s in compute_on(\"device_host\") "
             "regions: %s", name, error.value.decode(errors="replace"))
@@ -80,8 +68,8 @@ def install(library_path) -> None:
     return
   lib = ctypes.CDLL(os.fspath(library_path))
   fn = lib.metal_pjrt_register_host_ffi_handler
-  fn.argtypes = [ctypes.c_char_p] + [ctypes.c_void_p] * 5 + [
-      ctypes.c_char_p, ctypes.c_int64]
+  fn.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_char_p,
+                 ctypes.c_int64]
   fn.restype = ctypes.c_int
   _register = fn
 

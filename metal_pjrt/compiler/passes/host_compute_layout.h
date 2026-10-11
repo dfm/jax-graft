@@ -13,22 +13,15 @@
 namespace xla {
 namespace gpu {
 
-// Gives each host-offloaded region (jax.experimental.compute_on
-// ("device_host"): an async-start on the host thread wrapping a HostExecute
-// custom call) the parameter layouts its operands have.
-//
-// GPU layout assignment runs on the main thread only. It lays out the
-// async-start's operands (e.g. a MoveToDevice of another region's result
-// becomes row-major, with a copy) but leaves the wrapped computation's
-// parameters as they were, so the HLO verifier rejects the module (async
-// shape does not match the async computation's parameters). JAX's gradient
-// of a LAPACK call in a region does this: a column-major f64[n,1] residual
-// of the forward region feeds the backward one. The HostExecute's own
-// computation (the CPU code) already takes the operand's layout in that
-// case; where it does not, a copy at its start converts the operand to the
-// layout it expects, on the CPU.
-//
-// Runs right after layout assignment, on every execution thread.
+// Gives each host-offloaded region (compute_on("device_host"): a host-thread
+// async-start wrapping a HostExecute custom call) its operands' layouts as
+// parameter layouts. GPU layout assignment runs on the main thread only: it
+// lays out the async-start's operands but leaves the wrapped computation's
+// parameters, which the HLO verifier then rejects (JAX's gradient of a
+// LAPACK call in a region: a column-major f64[n,1] residual passed between
+// regions). Where the HostExecute's computation (the CPU code) expects
+// another layout, a copy at its start converts it on the CPU. Runs right
+// after layout assignment, on every execution thread.
 class MetalHostComputeLayoutFixer : public HloModulePass {
  public:
   absl::string_view name() const override {
