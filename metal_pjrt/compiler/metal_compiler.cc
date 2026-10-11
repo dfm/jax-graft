@@ -36,6 +36,7 @@
 #include "metal_pjrt/compiler/passes/complex_scatter.h"
 #include "metal_pjrt/compiler/passes/dot_upcast.h"
 #include "metal_pjrt/compiler/passes/hlo_checks.h"
+#include "metal_pjrt/compiler/passes/host_compute_layout.h"
 #include "metal_pjrt/compiler/passes/conv_rewriter.h"
 #include "metal_pjrt/compiler/passes/pool_rewriter.h"
 #include "metal_pjrt/compiler/passes/scan_rewriter.h"
@@ -279,6 +280,14 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
     const CompileOptions& options, const GpuTopology& gpu_topology,
     const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
     CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  {
+    // Before the base pipeline's verifier: layout assignment left
+    // host-offloaded regions' parameters behind their operands. On every
+    // thread, the regions' own included.
+    HloPassPipeline pipeline("metal-host-compute-layouts", compilation_stats);
+    pipeline.AddPass<MetalHostComputeLayoutFixer>();
+    TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
+  }
   TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
       hlo_module, stream_exec, options, gpu_topology, alias_info, thread_pool,
       compilation_stats, mlir_context));

@@ -215,6 +215,37 @@ cc_test(
 )
 
 cc_library(
+    name = "host_compute_layout",
+    srcs = ["host_compute_layout.cc"],
+    hdrs = ["host_compute_layout.h"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@xla//xla:shape_util",
+        "@xla//xla/hlo/ir:hlo",
+        "@xla//xla/hlo/pass:hlo_pass",
+        "@xla//xla/tsl/platform:errors",
+    ],
+)
+
+cc_test(
+    name = "host_compute_layout_test",
+    srcs = ["host_compute_layout_test.cc"],
+    deps = [
+        ":host_compute_layout",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:shape_util",
+        "@xla//xla/hlo/ir:hlo",
+        "@xla//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "@xla//xla/service:hlo_verifier",
+    ],
+)
+
+cc_library(
     name = "hlo_checks",
     srcs = ["hlo_checks.cc"],
     hdrs = ["hlo_checks.h"],
