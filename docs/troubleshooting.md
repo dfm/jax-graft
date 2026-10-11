@@ -137,11 +137,14 @@ Messages starting with `Metal:` name your operation and source line:
   jax.random: ...`
 - `Metal: jax.lax.mulhi on 64-bit integers is not supported ...` Use
   32-bit operands, or the CPU backend.
-- `Metal: lapack_dpotrf_ffi inside jax.experimental.compute_on("device_host")
-  is not supported ...` JAX lowers a `compute_on("device_host")` region for
-  the CPU, and its LAPACK calls (Cholesky, triangular solves, LU, ...)
-  belong to jaxlib, not the plugin. Move them out of the region, or run that
-  part outside `jit` under `jax.default_device(jax.devices("cpu")[0])`.
+- `Metal: <target> inside jax.experimental.compute_on("device_host") is not
+  supported ...` JAX lowers a `compute_on("device_host")` region with its CPU
+  rules, and the plugin runs jaxlib's CPU handlers there (LAPACK, and FFI
+  functions registered for "cpu"), but not this one: a handler with no host
+  version, or one jaxlib's FFI version does not match (logged as `cannot use
+  jaxlib's host FFI handler` at startup or first compile). Move it out of the
+  region, or run that part outside `jit` under
+  `jax.default_device(jax.devices("cpu")[0])`.
 - `Metal: bf16 matmul too large: ... Split the matmul or use float32` and
   `Metal: matmul operand ... has a batch, row or column group of ...
   elements; XLA's matmul config counts them in 32 bits. Split the batch

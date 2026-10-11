@@ -244,13 +244,28 @@ def test_compute_on_host():
         _, s = jax.jit(lambda x: jax.lax.scan(
             lambda c, _: (c * 0.5, piece(c)), x, None, length=20))(x)
         assert np.asarray(s)[0] == want
-        # JAX lowers the region for the CPU; its LAPACK calls are jaxlib's,
-        # which this plugin cannot run: refused at compile time (XLA would
-        # abort the process).
-        chol = on_host(lambda a: jnp.linalg.cholesky(a.astype(jnp.float64)))
-        with pytest.raises(Exception, match="lapack_dpotrf_ffi"):
-            jax.jit(lambda a: chol(a).astype(jnp.float32))(
-                jnp.eye(4, dtype=jnp.float32))
+        # JAX lowers the region with its CPU rules: LAPACK calls are jaxlib's
+        # handlers (forwarded by _host_ffi.py), and their gradient passes a
+        # column-major f64[n,1] residual between regions
+        # (MetalHostComputeLayoutFixer).
+        a = jnp.asarray(np.eye(8, dtype=np.float32) * 4 + 1)
+        b = jnp.arange(8, dtype=jnp.float32)
+        quad = on_host(lambda a, b: (lambda L, b: b @ jax.scipy.linalg.cho_solve(
+            (L, True), b))(jnp.linalg.cholesky(a.astype(jnp.float64)),
+                           b.astype(jnp.float64)).astype(jnp.float32))
+        a64, b64 = np.asarray(a, np.float64), np.asarray(b, np.float64)
+        np.testing.assert_allclose(float(jax.jit(quad)(a, b)),
+                                   b64 @ np.linalg.solve(a64, b64), rtol=1e-6)
+        np.testing.assert_allclose(np.asarray(jax.jit(jax.grad(quad, 1))(a, b)),
+                                   2 * np.linalg.solve(a64, b64), rtol=1e-5)
+        # Python callbacks in a region (the plugin's handler, for the host).
+        # f32 out: the callback runs on an XLA thread, outside this
+        # thread-local enable_x64.
+        cb = on_host(lambda z: jax.pure_callback(
+            lambda z: (np.asarray(z, np.float64) * 2).astype(np.float32),
+            jax.ShapeDtypeStruct(z.shape, jnp.float32), z))
+        np.testing.assert_array_equal(np.asarray(jax.jit(cb)(x)),
+                                      np.asarray(x) * 2)
 
 
 def _memory_stats():

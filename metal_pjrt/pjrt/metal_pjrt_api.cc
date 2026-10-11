@@ -372,7 +372,10 @@ extern "C" PJRT_CAPI_EXPORT const PJRT_Api* GetPjrtApi() {
 //   the error buffer, whose capacity includes the NUL), the
 //   MetalPjrtCallbackBuffer layout (a ctypes Structure in _callbacks.py) and
 //   the XLA PrimitiveType numbers that encode its dtypes
-//   (metal_pjrt/ffi/python_callback_ffi.cc);
+//   (metal_pjrt/ffi/python_callback_ffi.cc), whose handler is also
+//   registered for the host (compute_on("device_host") regions);
+// - metal_pjrt_register_host_ffi_handler, with which the frontend registers
+//   jaxlib's CPU FFI handlers for those regions (metal_pjrt/ffi/host_ffi.cc);
 // - the environment variables both sides act on (METAL_PJRT_DISABLE_LAPACK,
 //   METAL_PJRT_DISABLE_FFT, which the library also puts in the cache key)
 //   and their boolean parsing (EnvFlag in runtime/env.h, _env_flag);
@@ -388,5 +391,5 @@ extern "C" PJRT_CAPI_EXPORT const PJRT_Api* GetPjrtApi() {
 // a library whose version differs from its own (_CORE_ABI_VERSION in
 // jax_graft/__init__.py).
 extern "C" PJRT_CAPI_EXPORT int metal_pjrt_frontend_abi_version() {
-  return 1;
+  return 2;
 }

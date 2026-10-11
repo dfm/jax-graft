@@ -12,7 +12,9 @@
 // installs through the exported C function below (via ctypes; ctypes
 // acquires the GIL when a foreign thread calls the trampoline).
 //
-// The handler waits for all prior work on the execution stream; buffers are
+// The handler waits for all prior work on the execution stream (the "Host"
+// one, for compute_on("device_host") regions, runs when XLA:CPU has its
+// operands ready and has no stream); buffers are
 // shared-storage MTLBuffers whose "device pointers" are host addresses, so the
 // trampoline reads arguments and writes results in place (row-major, the
 // custom call's default layout). Token operands/results are skipped.
@@ -60,8 +62,8 @@ namespace xffi = ::xla::ffi;
 
 std::atomic<MetalPjrtPythonCallbackTrampoline> g_trampoline{nullptr};
 
-absl::Status PythonCallback(stream_executor::Stream* stream,
-                            uint64_t callback_id, xffi::RemainingArgs args,
+// Calls the trampoline on the operands and results in place.
+absl::Status CallTrampoline(uint64_t callback_id, xffi::RemainingArgs args,
                             xffi::RemainingRets rets) {
   MetalPjrtPythonCallbackTrampoline trampoline = g_trampoline.load();
   if (trampoline == nullptr) {
@@ -70,11 +72,6 @@ absl::Status PythonCallback(stream_executor::Stream* stream,
         "install them (see the \"host callbacks unavailable\" warning logged "
         "when JAX initialized the plugin)");
   }
-  absl::StatusOr<MetalContext> ctx = GetMetalContext(stream);
-  if (!ctx.ok()) return ctx.status();
-  // Everything enqueued before this custom call must have finished before
-  // the host reads its operands (and before it overwrites its results).
-  if (absl::Status s = ctx->stream->Synchronize(); !s.ok()) return s;
 
   auto describe = [](const xffi::AnyBuffer& b) {
     MetalPjrtCallbackBuffer d;
@@ -113,6 +110,24 @@ absl::Status PythonCallback(stream_executor::Stream* stream,
   return absl::OkStatus();
 }
 
+absl::Status PythonCallback(stream_executor::Stream* stream,
+                            uint64_t callback_id, xffi::RemainingArgs args,
+                            xffi::RemainingRets rets) {
+  absl::StatusOr<MetalContext> ctx = GetMetalContext(stream);
+  if (!ctx.ok()) return ctx.status();
+  // Everything enqueued before this custom call must have finished before
+  // the host reads its operands (and before it overwrites its results).
+  if (absl::Status s = ctx->stream->Synchronize(); !s.ok()) return s;
+  return CallTrampoline(callback_id, args, rets);
+}
+
+// In a compute_on("device_host") region, which XLA:CPU runs once its
+// operands are ready: no stream to wait for.
+absl::Status HostPythonCallback(uint64_t callback_id, xffi::RemainingArgs args,
+                                xffi::RemainingRets rets) {
+  return CallTrampoline(callback_id, args, rets);
+}
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER(kMetalPythonCallback, PythonCallback,
@@ -124,6 +139,15 @@ XLA_FFI_DEFINE_HANDLER(kMetalPythonCallback, PythonCallback,
 
 XLA_FFI_REGISTER_HANDLER(xffi::GetXlaFfiApi(), "xla_ffi_python_metal_callback",
                          "METAL", kMetalPythonCallback);
+
+XLA_FFI_DEFINE_HANDLER(kHostPythonCallback, HostPythonCallback,
+                       xffi::Ffi::Bind()
+                           .Attr<uint64_t>("callback_id")
+                           .RemainingArgs()
+                           .RemainingRets());
+
+XLA_FFI_REGISTER_HANDLER(xffi::GetXlaFfiApi(), "xla_ffi_python_metal_callback",
+                         "Host", kHostPythonCallback);
 
 }  // namespace ffi
 }  // namespace metal_pjrt
