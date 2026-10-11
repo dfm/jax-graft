@@ -4,14 +4,18 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
+#include "absl/algorithm/container.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
 #include "metal_pjrt/blas/blas_lt_support.h"
 #include "metal_pjrt/compiler/passes/dot_upcast.h"
 #include "metal_pjrt/compiler/passes/hlo_checks.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/transforms/simplifiers/convolution_group_converter.h"
@@ -437,31 +441,160 @@ ENTRY e {
   EXPECT_TRUE(CheckPostGemmRewriter(**module).ok());
 }
 
-// XLA would compile a host-offloaded region with XLA:CPU (no metal$
-// handlers there) and CHECK-fail; refused before any pass runs.
-TEST_F(MetalHloChecksTest, HostOffloadingIsRefused) {
+// compute_on("device_host") regions run on the CPU: hidden from the
+// plugin's pipelines (moved to the host thread), everything they call
+// included, until restored; CheckPostGemmRewriter skips host-thread
+// computations, e.g. f64 arithmetic in one.
+TEST_F(MetalHloChecksTest, HostComputeIsHidden) {
   const std::string kHost = R"(
 HloModule m
+add {
+  a = f64[] parameter(0)
+  b = f64[] parameter(1)
+  ROOT s = f64[] add(a, b)
+}
 f {
   p = f32[4] parameter(0)
-  ROOT r = f32[4] negate(p)
+  d = f64[4] convert(p)
+  z = f64[] constant(0)
+  r = f64[] reduce(d, z), dimensions={0}, to_apply=add
+  ROOT o = f32[] convert(r)
 }
 ENTRY e {
   x = f32[4] parameter(0)
-  ROOT c = f32[4] call(x), to_apply=f, frontend_attributes={_xla_compute_type="$T"}, metadata={op_name="jit(f)/compute_on"}
+  ROOT c = f32[] call(x), to_apply=f, frontend_attributes={_xla_compute_type="$T"}
 })";
-  auto check = [&](const std::string& type) {
+  for (const std::string type : {"host", "dense"}) {
     auto module = ParseAndReturnUnverifiedModule(
         absl::StrReplaceAll(kHost, {{"$T", type}}));
+    ASSERT_TRUE(module.ok()) << module.status();
+    HloModule* m = module->get();
+    auto hidden = HostComputeHidden::Hide(m);
+    ASSERT_TRUE(hidden.ok()) << hidden.status();
+    std::vector<std::string> main;
+    for (HloComputation* comp :
+         m->computations({HloInstruction::kMainExecutionThread})) {
+      main.emplace_back(comp->name());
+    }
+    // compute_on("device") is an ordinary call.
+    EXPECT_EQ(main.size(), type == "host" ? 1 : 3);
+    // The f64 reduce is refused on the GPU, not in a host computation.
+    EXPECT_EQ(CheckPostGemmRewriter(*m).ok(), type == "host");
+    hidden->Restore();
+    for (HloComputation* comp : m->computations()) {
+      EXPECT_TRUE(comp->IsMainThread()) << comp->name();
+    }
+  }
+}
+
+// Every computation gets one caller: a reducer two reduces in a region
+// share (else XLA's host-call wrapper offloads its ops again, nested), and
+// a computation called both in a region and outside (else hiding it would
+// keep it from the plugin's passes).
+TEST_F(MetalHloChecksTest, SharedComputationsAreCloned) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+add {
+  a = f64[] parameter(0)
+  b = f64[] parameter(1)
+  ROOT s = f64[] add(a, b)
+}
+f {
+  p = f64[4] parameter(0)
+  z = f64[] constant(0)
+  r1 = f64[] reduce(p, z), dimensions={0}, to_apply=add
+  r2 = f64[] reduce(p, z), dimensions={0}, to_apply=add
+  ROOT t = f64[] add(r1, r2)
+}
+ENTRY e {
+  x = f64[4] parameter(0)
+  h = f64[] call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+  g = f64[] call(x), to_apply=f
+  ROOT s = f64[] add(h, g)
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  HloModule* m = module->get();
+  auto hidden = HostComputeHidden::Hide(m);
+  ASSERT_TRUE(hidden.ok()) << hidden.status();
+  for (const HloComputation* comp : m->computations()) {
+    EXPECT_LE(comp->caller_instructions().size(), 1) << comp->name();
+  }
+  // The entry, and the main call's f and reducers.
+  EXPECT_EQ(absl::c_distance(
+                m->computations({HloInstruction::kMainExecutionThread})),
+            4);
+}
+
+// Refused while hiding, since XLA would abort compiling them: a custom call
+// XLA:CPU has no handler for (here jaxlib's CPU Cholesky, which JAX's CPU
+// lowering emits in a region), and a single marked op (JAX 0.10's legacy
+// compute_on), which cannot be hidden. XLA's pass-through annotations in a
+// region, and the call's results (which carry its attributes), are fine.
+TEST_F(MetalHloChecksTest, HostComputeRefusals) {
+  auto check = [&](const char* hlo) {
+    auto module = ParseAndReturnUnverifiedModule(hlo);
     EXPECT_TRUE(module.ok()) << module.status();
     if (!module.ok()) return module.status();
-    return CheckBeforeOptimization(**module);
+    return HostComputeHidden::Hide(module->get()).status();
   };
-  absl::Status host = check("host");
-  EXPECT_EQ(host.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_NE(host.message().find("compute_on"), std::string::npos) << host;
-  // What JAX writes for compute_on("device") (mlir.map_compute_type).
-  EXPECT_TRUE(check("dense").ok());
+  absl::Status lapack = check(R"(
+HloModule m
+f {
+  p = f64[4,4] parameter(0)
+  ROOT r = (f64[4,4], s32[]) custom-call(p), custom_call_target="lapack_dpotrf_ffi", api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(f)/cholesky"}
+}
+ENTRY e {
+  x = f64[4,4] parameter(0)
+  ROOT c = (f64[4,4], s32[]) call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+})");
+  EXPECT_EQ(lapack.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_NE(lapack.message().find("lapack_dpotrf_ffi"), std::string::npos)
+      << lapack;
+  EXPECT_NE(lapack.message().find("jit(f)/cholesky"), std::string::npos)
+      << lapack;
+  absl::Status single = check(R"(
+HloModule m
+ENTRY e {
+  x = f64[4] parameter(0)
+  ROOT n = f64[4] negate(x), frontend_attributes={_xla_compute_type="host"}
+})");
+  EXPECT_EQ(single.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_NE(single.message().find("compute_type"), std::string::npos)
+      << single;
+  EXPECT_TRUE(check(R"(
+HloModule m
+f {
+  p = f32[4] parameter(0)
+  s = f32[4] custom-call(p), custom_call_target="Sharding", sharding={replicated}
+  ROOT t = (f32[4], f32[4]) tuple(s, s)
+}
+ENTRY e {
+  x = f32[4] parameter(0)
+  c = (f32[4], f32[4]) call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+  ROOT g = f32[4] get-tuple-element(c), index=0, frontend_attributes={_xla_compute_type="host"}
+})").ok());
+}
+
+// An async op left inside a host-thread computation is refused, not
+// handed to XLA:CPU (which would abort).
+TEST_F(MetalHloChecksTest, AsyncInHostComputationIsRefused) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+inner {
+  q = f32[4] parameter(0)
+  ROOT n = f32[4] negate(q)
+}, execution_thread="host"
+f {
+  p = f32[4] parameter(0)
+  s = ((f32[4]), f32[4], u32[]) async-start(p), async_execution_thread="host", calls=inner
+  ROOT d = f32[4] async-done(s)
+}, execution_thread="host"
+ENTRY e {
+  ROOT x = f32[4] parameter(0)
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  EXPECT_EQ(CheckPostGemmRewriter(**module).code(),
+            absl::StatusCode::kInternal);
 }
 
 // lax.rng_uniform: RngExpander leaves an rng-get-and-update-state, which

@@ -61,6 +61,9 @@ cc_binary(
         "-Wl,-exported_symbol,_metal_pjrt_frontend_abi_version",
         # Host callbacks: jax_graft/_callbacks.py installs its trampoline.
         "-Wl,-exported_symbol,_metal_pjrt_register_python_callback_trampoline",
+        # compute_on("device_host"): jax_graft/_host_ffi.py registers jaxlib's
+        # CPU FFI handlers (ffi/host_ffi.cc).
+        "-Wl,-exported_symbol,_metal_pjrt_register_host_ffi_handler",
         # Memory stats and the memory-pressure test hook (metal_runtime.cc).
         "-Wl,-exported_symbol,_metal_pjrt_memory_stats",
         "-Wl,-exported_symbol,_metal_pjrt_testing_memory_pressure",

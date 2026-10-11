@@ -6,14 +6,17 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "metal_pjrt/blas/blas_lt_support.h"
 #include "metal_pjrt/compiler/passes/dot_upcast.h"
 #include "metal_pjrt/compiler/report_bug.h"
+#include "xla/ffi/ffi_registry.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -21,10 +24,12 @@
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_module_metadata.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/transforms/simplifiers/flatten_call_graph.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/primitive_util.h"
+#include "xla/service/custom_call_target_registry.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
@@ -247,28 +252,130 @@ bool NeedsWideAtomics(const HloInstruction& instr) {
   return wide;
 }
 
+// Whether XLA:CPU can compile this custom call in a host-offloaded region:
+// one of its own targets (cpu/thunk_emitter.cc), or a handler registered for
+// the host in this binary (cpu/runtime/custom_call_thunk.cc looks there).
+// JAX lowers compute_on("device_host") regions with its CPU rules, whose
+// LAPACK calls (lapack_*_ffi) jaxlib registers in its own copy of XLA, not
+// in this one.
+bool HostCanRun(const HloInstruction& instr) {
+  const std::string& target = instr.custom_call_target();
+  if (target == "TopK" || target == "SliceToDynamic" ||
+      target == "GetRngSeed") {
+    return true;
+  }
+  // Annotations JAX may emit in a region, which XLA removes on the main
+  // thread before it moves the region to the host (ShardingRemover,
+  // ConvertMemoryPlacementToInternalAnnotations).
+  if (target == "Sharding" || target == "SPMDFullToShardShape" ||
+      target == "SPMDShardToFullShape" ||
+      target == "annotate_device_placement") {
+    return true;
+  }
+  if (Cast<HloCustomCallInstruction>(&instr)->api_version() ==
+      CustomCallApiVersion::API_VERSION_TYPED_FFI) {
+    return ffi::FindHandler(target, "Host").ok();
+  }
+  return CustomCallTargetRegistry::Global()->Lookup(target, "Host") != nullptr;
+}
+
 }  // namespace
 
-absl::Status CheckBeforeOptimization(const HloModule& module) {
-  for (const HloComputation* comp : module.computations()) {
-    for (const HloInstruction* instr : comp->instructions()) {
-      // kXlaComputeTypeAttr / kXlaComputeTypeHost (xla/side_effect_util.h).
-      const auto& attributes = instr->frontend_attributes().map();
-      auto type = attributes.find("_xla_compute_type");
-      if (type != attributes.end() && type->second == "host") {
+absl::StatusOr<HostComputeHidden> HostComputeHidden::Hide(
+    HloModule* module) {
+  HostComputeHidden result;
+  auto host_typed = [](const HloInstruction* instr) {
+    // kXlaComputeTypeAttr / kXlaComputeTypeHost (xla/side_effect_util.h).
+    auto it = instr->frontend_attributes().map().find("_xla_compute_type");
+    return it != instr->frontend_attributes().map().end() &&
+           it->second == "host";
+  };
+  if (!absl::c_any_of(module->computations(), [&](const HloComputation* c) {
+        return absl::c_any_of(c->instructions(), host_typed);
+      })) {
+    return result;
+  }
+  TF_RETURN_IF_ERROR(FlattenCallGraph().Run(module).status());
+
+  absl::flat_hash_set<HloComputation*> seen;
+  for (HloComputation* comp : module->computations()) {
+    for (HloInstruction* instr : comp->instructions()) {
+      if (!host_typed(instr)) continue;
+      for (HloComputation* called : instr->called_computations()) {
+        if (seen.insert(called).second) result.hidden_.push_back(called);
+      }
+    }
+  }
+  for (size_t i = 0; i < result.hidden_.size(); ++i) {
+    for (HloInstruction* instr : result.hidden_[i]->instructions()) {
+      for (HloComputation* called : instr->called_computations()) {
+        if (seen.insert(called).second) result.hidden_.push_back(called);
+      }
+    }
+  }
+  for (HloComputation* comp : module->computations()) {
+    const bool in_region = seen.contains(comp);
+    for (HloInstruction* instr : comp->instructions()) {
+      // Outside a region, only the region's call and the results taken from
+      // it (the HLO import copies its attributes onto them) may be marked:
+      // a single marked op (JAX 0.10's legacy compute_on) cannot be hidden.
+      if (!in_region && host_typed(instr) &&
+          instr->opcode() != HloOpcode::kCall &&
+          !(instr->opcode() == HloOpcode::kGetTupleElement &&
+            instr->operand(0)->opcode() == HloOpcode::kCall)) {
         return absl::UnimplementedError(absl::StrCat(
-            "Metal: host offloading (jax.experimental.compute_on("
-            "\"device_host\")) is not supported; run that part on the CPU "
-            "backend instead: ",
+            "Metal: this form of compute_on(\"device_host\") is not "
+            "supported (it marks single ops); use "
+            "jax.experimental.compute_on.compute_on(f, "
+            "compute_type=\"device_host\", out_memory_spaces=...) "
+            "(JAX 0.11 or later): ",
+            DescribeOp(*instr)));
+      }
+      if (in_region && instr->opcode() == HloOpcode::kCustomCall &&
+          !HostCanRun(*instr)) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Metal: ", instr->custom_call_target(),
+            " inside jax.experimental.compute_on(\"device_host\") is not "
+            "supported (JAX lowers that region for the CPU, and this plugin "
+            "has no CPU implementation of it); move it out of the region: ",
             DescribeOp(*instr)));
       }
     }
   }
-  return absl::OkStatus();
+  // While hidden, a main-thread call reaches a host-thread computation,
+  // which HloVerifier rejects; no pipeline in between may run it.
+  for (HloComputation* comp : result.hidden_) {
+    comp->SetExecutionThread(HloInstruction::kHostThread);
+  }
+  return result;
+}
+
+void HostComputeHidden::Restore() {
+  for (HloComputation* comp : hidden_) {
+    comp->SetExecutionThread(HloInstruction::kMainExecutionThread);
+  }
+  hidden_.clear();
 }
 
 absl::Status CheckPostGemmRewriter(const HloModule& module) {
+  // An async op inside a host-offloaded region (a region nested in it)
+  // would make XLA:CPU's compile fail, which aborts the process.
   for (const HloComputation* comp : module.computations()) {
+    if (comp->execution_thread() != HloInstruction::kHostThread) continue;
+    for (const HloInstruction* instr : comp->instructions()) {
+      if (instr->opcode() == HloOpcode::kAsyncStart ||
+          instr->opcode() == HloOpcode::kAsyncUpdate ||
+          instr->opcode() == HloOpcode::kAsyncDone) {
+        return absl::InternalError(absl::StrCat(
+            "Metal: an async op inside a compute_on(\"device_host\") "
+            "region: ",
+            DescribeOp(*instr), metal_pjrt::kReportBug));
+      }
+    }
+  }
+  // Host-offloaded computations run on the CPU (see HostComputeHidden).
+  for (const HloComputation* comp :
+       module.computations({HloInstruction::kMainExecutionThread})) {
     for (const HloInstruction* instr : comp->instructions()) {
       if (instr->opcode() == HloOpcode::kRng ||
           instr->opcode() == HloOpcode::kRngGetAndUpdateState) {

@@ -54,7 +54,7 @@ _JAX_MIN = (0, 10, 0)
 # shared environment variables and the platform name. A library with another
 # version is not registered; it stays loaded (reading the version loads it,
 # and unloading XLA is not safe), which is harmless.
-_CORE_ABI_VERSION = 1
+_CORE_ABI_VERSION = 2
 
 
 def _env_flag(name: str) -> bool:
@@ -279,3 +279,10 @@ def initialize():
         _callbacks.install(path)
     except Exception as e:  # noqa: BLE001 - never break plugin init
         logger.warning("jax-graft: host callbacks unavailable: %s", e)
+    # jaxlib's linear algebra in compute_on("device_host") regions.
+    try:
+        from jax_graft import _host_ffi
+        _host_ffi.install(path)
+    except Exception as e:  # noqa: BLE001 - never break plugin init
+        logger.warning("jax-graft: jaxlib's linear algebra unavailable in "
+                       "compute_on(\"device_host\") regions: %s", e)

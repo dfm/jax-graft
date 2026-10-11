@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/numbers.h"
@@ -35,6 +36,7 @@
 #include "metal_pjrt/compiler/passes/complex_scatter.h"
 #include "metal_pjrt/compiler/passes/dot_upcast.h"
 #include "metal_pjrt/compiler/passes/hlo_checks.h"
+#include "metal_pjrt/compiler/passes/host_compute_layout.h"
 #include "metal_pjrt/compiler/passes/conv_rewriter.h"
 #include "metal_pjrt/compiler/passes/pool_rewriter.h"
 #include "metal_pjrt/compiler/passes/scan_rewriter.h"
@@ -62,6 +64,11 @@ namespace xla {
 namespace gpu {
 
 namespace {
+
+// The plugin's pipelines run where XLA's own do: the main execution thread,
+// never host-offloaded computations (see HostComputeHidden).
+const absl::flat_hash_set<absl::string_view> kMain = {
+    HloInstruction::kMainExecutionThread};
 
 // XLA emits constants as global variables with array initializers. Turn each
 // one into a named byte blob for the constants container.
@@ -194,20 +201,23 @@ absl::Status MetalCompiler::OptimizeHloConvolutionCanonicalization(
   pipeline.AddPass<CallInliner>();
   pipeline.AddPass<TupleSimplifier>();
   pipeline.AddPass<HloDCE>();
-  return pipeline.Run(hlo_module).status();
+  return pipeline.Run(hlo_module, kMain).status();
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
     std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
     const CompileOptions& options) {
   ApplyMetalDefaults(module->mutable_config().mutable_debug_options());
-  TF_RETURN_IF_ERROR(CheckBeforeOptimization(*module));
+  // Host-offloaded regions (compute_on("device_host")) run on the CPU and
+  // keep their ops: hidden from the plugin's pipelines below.
+  TF_ASSIGN_OR_RETURN(HostComputeHidden host_compute,
+                      HostComputeHidden::Hide(module.get()));
   {
     // Complex64 dots become real f32 dots (MetalBlasLt has no complex GEMM),
     // before the simplifier and GemmRewriter see them.
     HloPassPipeline pipeline("metal-complex-dots");
     pipeline.AddPass<MetalComplexDotExpander>();
-    TF_RETURN_IF_ERROR(pipeline.Run(module.get()).status());
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
   }
   // --- begin linalg (Accelerate LAPACK) ---
   // kCholesky / kTriangularSolve -> metal$cholesky / metal$triangular_solve,
@@ -215,7 +225,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
   if (!LapackDisabled()) {
     HloPassPipeline pipeline("metal-linalg");
     pipeline.AddPass<MetalLinalgRewriter>();
-    TF_RETURN_IF_ERROR(pipeline.Run(module.get()).status());
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
   }
   // --- end linalg ---
   if (Settings().scan_rewrite || Settings().pool_rewrite) {
@@ -223,14 +233,14 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
     HloPassPipeline pipeline("metal-pre-optimization");
     if (Settings().scan_rewrite) pipeline.AddPass<MetalScanRewriter>();
     if (Settings().pool_rewrite) pipeline.AddPass<MetalPoolMaxBwdRewriter>();
-    TF_RETURN_IF_ERROR(pipeline.Run(module.get()).status());
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
   }
   // Every sort ends up stable whatever its is_stable flag: SortRewriter's
   // radix sort is stable, and MetalSortExpander breaks ties on the original
   // index. On a key-only sort the flag only makes StableSortExpander add an
   // iota operand (and tie-break) that the bitonic network then carries next
   // to its own index.
-  for (HloComputation* computation : module->computations()) {
+  for (HloComputation* computation : module->computations(kMain)) {
     for (HloInstruction* instr : computation->instructions()) {
       if (instr->opcode() == HloOpcode::kSort && instr->operand_count() == 1) {
         Cast<HloSortInstruction>(instr)->set_is_stable(false);
@@ -259,8 +269,9 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
     });
     pipeline.AddPass<MetalSortExpander>(kMaxUnrolledSortDim,
                                         kCubSortMinElements);
-    TF_RETURN_IF_ERROR(pipeline.Run(module.get()).status());
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get(), kMain).status());
   }
+  host_compute.Restore();
   return GpuCompiler::RunHloPasses(std::move(module), stream_exec, options);
 }
 
@@ -269,13 +280,21 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
     const CompileOptions& options, const GpuTopology& gpu_topology,
     const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
     CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  {
+    // Before the base pipeline's verifier: layout assignment left
+    // host-offloaded regions' parameters behind their operands. On every
+    // thread, the regions' own included.
+    HloPassPipeline pipeline("metal-host-compute-layouts", compilation_stats);
+    pipeline.AddPass<MetalHostComputeLayoutFixer>();
+    TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
+  }
   TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
       hlo_module, stream_exec, options, gpu_topology, alias_info, thread_pool,
       compilation_stats, mlir_context));
   // After GemmRewriter, so only the dots left for the loop emitter change.
   HloPassPipeline pipeline("metal-post-gemm", compilation_stats);
   pipeline.AddPass<MetalDotOperandUpcaster>();
-  TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
+  TF_RETURN_IF_ERROR(pipeline.Run(hlo_module, kMain).status());
   return CheckPostGemmRewriter(*hlo_module);
 }
 

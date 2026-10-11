@@ -137,9 +137,19 @@ Messages starting with `Metal:` name your operation and source line:
   jax.random: ...`
 - `Metal: jax.lax.mulhi on 64-bit integers is not supported ...` Use
   32-bit operands, or the CPU backend.
-- `Metal: host offloading (jax.experimental.compute_on("device_host")) is
-  not supported; run that part on the CPU backend instead: ...` Run that
-  part outside `jit` under `jax.default_device(jax.devices("cpu")[0])`.
+- `Metal: <target> inside jax.experimental.compute_on("device_host") is not
+  supported ...` JAX lowers a `compute_on("device_host")` region with its CPU
+  rules. The plugin runs jaxlib's linear algebra handlers there (LAPACK), but
+  no other CPU FFI functions (jaxlib's CPU Python callbacks, your own
+  registered for "cpu"). A LAPACK handler whose FFI version this library does
+  not accept is logged as `cannot use jaxlib's ...` when the first region is
+  lowered. Move the call out of the region, or run that part outside `jit` under
+  `jax.default_device(jax.devices("cpu")[0])`. For `lapack_*_ffi` this
+  can also mean no region has been lowered yet in this process (the
+  plugin registers jaxlib's LAPACK when the first one is): a function
+  deserialized with `jax.export` in a fresh process does not lower one, so
+  run any `compute_on("device_host")` region with linear algebra under
+  `jit` first.
 - `Metal: bf16 matmul too large: ... Split the matmul or use float32` and
   `Metal: matmul operand ... has a batch, row or column group of ...
   elements; XLA's matmul config counts them in 32 bits. Split the batch

@@ -9,14 +9,17 @@ package(default_visibility = ["//visibility:public"])
 # compiler's scan, convolution and max-pool rewriters target (metal$scan,
 # metal$conv, metal$pool_max_bwd),
 # the FFT handler the Python fft lowering targets (metal$fft),
-# XLA's SortRewriter targets (xla.gpu.ext.cub_sort_keys/pairs) and the Python
-# callback handler. Handlers register statically, so this is alwayslink.
+# XLA's SortRewriter targets (xla.gpu.ext.cub_sort_keys/pairs), the Python
+# callback handler, and the export that registers jaxlib's CPU handlers
+# for compute_on("device_host") regions (host_ffi.cc). Handlers register
+# statically, so this is alwayslink.
 cc_library(
     name = "metal_ffi",
     srcs = [
         "conv_ffi.cc",
         "cub_sort_ffi.cc",
         "fft_ffi.cc",
+        "host_ffi.cc",
         "metal_ffi.cc",
         "pool_ffi.cc",
         "python_callback_ffi.cc",
@@ -47,6 +50,8 @@ cc_library(
         "@xla//xla/backends/gpu:ffi",
         "@xla//xla/ffi",
         "@xla//xla/ffi:ffi_api",
+        "@xla//xla/ffi:ffi_registry",
+        "@xla//xla/ffi/api:c_api",
         "@xla//xla/stream_executor:platform",
         "@xla//xla/stream_executor:platform_manager",
         "@xla//xla/stream_executor:stream",

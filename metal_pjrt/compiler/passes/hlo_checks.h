@@ -5,8 +5,12 @@
 #define METAL_PJRT_COMPILER_PASSES_HLO_CHECKS_H_
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 
@@ -42,18 +46,40 @@ std::string DescribeOp(const HloInstruction& instr);
 //  - every cuBLASLt GEMM is a plain "__cublas$lt$matmul" whose element types,
 //    epilogue and (for f16/bf16, steel only) shape MetalBlasLt supports
 //    (blas_lt_support.h).
+//  - no async op in a host-offloaded (host-thread) computation: XLA:CPU
+//    cannot compile one, and XLA aborts when that compile fails.
 // Returns an error naming the first offending op, so a violation fails at
 // compile time instead of at run time or with wrong values.
 absl::Status CheckPostGemmRewriter(const HloModule& module);
 
-// What has to be refused before any pass runs: host offloading
-// (jax.experimental.compute_on("device_host"), frontend attribute
-// _xla_compute_type = "host"). XLA compiles such a region with XLA:CPU,
-// which has none of the plugin's FFI handlers, after the plugin's passes
-// have rewritten the ops inside it into metal$ calls, and it CHECK-fails
-// when that compile fails (gpu_compiler.cc, "Failed to compile host
-// executable").
-absl::Status CheckBeforeOptimization(const HloModule& module);
+// Host-offloaded regions (jax.experimental.compute_on("device_host"): calls
+// with frontend attribute _xla_compute_type = "host") run on the CPU: XLA
+// compiles them with XLA:CPU (HostExecute), which has none of the plugin's
+// handlers, and aborts the process when that compile fails. So the plugin's
+// passes and checks must leave them alone (they may also compute in f64).
+// XLA moves them to the host execution thread (HostComputeAsyncifier), which
+// pipelines run on {kMainExecutionThread} skip; before that, this object
+// moves them (and everything they call) there, until Restore() or its
+// destruction.
+class HostComputeHidden {
+ public:
+  // Gives every computation one caller first (FlattenCallGraph, which XLA
+  // runs only later: HloHostDeviceTypeCallWrapper would otherwise offload a
+  // helper called twice in a region again, nested, which XLA:CPU cannot
+  // compile). Refuses a custom call in a region that XLA:CPU cannot run,
+  // and a host-typed op that is not a call (JAX 0.10's legacy compute_on).
+  static absl::StatusOr<HostComputeHidden> Hide(HloModule* module);
+
+  HostComputeHidden(HostComputeHidden&& other) noexcept
+      : hidden_(std::exchange(other.hidden_, {})) {}
+  HostComputeHidden& operator=(HostComputeHidden&&) = delete;
+  ~HostComputeHidden() { Restore(); }
+  void Restore();
+
+ private:
+  HostComputeHidden() = default;
+  std::vector<HloComputation*> hidden_;
+};
 
 
 }  // namespace gpu
