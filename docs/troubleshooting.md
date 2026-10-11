@@ -139,11 +139,11 @@ Messages starting with `Metal:` name your operation and source line:
   32-bit operands, or the CPU backend.
 - `Metal: <target> inside jax.experimental.compute_on("device_host") is not
   supported ...` JAX lowers a `compute_on("device_host")` region with its CPU
-  rules, and the plugin runs jaxlib's CPU handlers there (LAPACK, and FFI
-  functions registered for "cpu"), but not this one: a handler with no host
-  version, or one jaxlib's FFI version does not match (logged as `cannot use
-  jaxlib's host FFI handler` at startup or first compile). Move it out of the
-  region, or run that part outside `jit` under
+  rules. The plugin runs jaxlib's linear algebra handlers there (LAPACK), but
+  no other CPU FFI functions (jaxlib's CPU Python callbacks, your own
+  registered for "cpu"). A LAPACK handler whose FFI version this library does
+  not accept is logged as `cannot use jaxlib's ...` when the first region is
+  lowered. Move the call out of the region, or run that part outside `jit` under
   `jax.default_device(jax.devices("cpu")[0])`. For `lapack_*_ffi` this
   can also mean no region has been lowered yet in this process (the
   plugin registers jaxlib's LAPACK when the first one is): a function
