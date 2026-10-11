@@ -62,6 +62,7 @@ cc_library(
         "@xla//xla/service:dump",
         "@xla//xla/service:triangular_solve_expander",
         "@xla//xla/service:hlo_module_config",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@xla//xla/service/gpu:gpu_compiler",
         "@xla//xla/backends/gpu/codegen:kernel_compiler",
         "@xla//xla/service/gpu:target_constants",

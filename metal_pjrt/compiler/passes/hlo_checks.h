@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -46,14 +47,18 @@ std::string DescribeOp(const HloInstruction& instr);
 // compile time instead of at run time or with wrong values.
 absl::Status CheckPostGemmRewriter(const HloModule& module);
 
-// What has to be refused before any pass runs: host offloading
-// (jax.experimental.compute_on("device_host"), frontend attribute
-// _xla_compute_type = "host"). XLA compiles such a region with XLA:CPU,
-// which has none of the plugin's FFI handlers, after the plugin's passes
-// have rewritten the ops inside it into metal$ calls, and it CHECK-fails
-// when that compile fails (gpu_compiler.cc, "Failed to compile host
-// executable").
-absl::Status CheckBeforeOptimization(const HloModule& module);
+// Host-offloaded regions (jax.experimental.compute_on("device_host"): calls
+// with frontend attribute _xla_compute_type = "host") run on the CPU. XLA
+// compiles them with XLA:CPU (gpu_compiler.cc, HostExecute), which has none
+// of the plugin's FFI handlers and CHECK-fails when that compile fails, so
+// the plugin's rewrites and checks must leave them alone (they may also
+// compute in f64). XLA moves them to the host execution thread itself
+// (HostComputeAsyncifier), after which pipelines run on
+// {kMainExecutionThread} skip them; before that, this moves them (and
+// everything they call) there while `fn` runs, and back afterwards. Refuses
+// (before running `fn`) a custom call inside one that XLA:CPU cannot run.
+absl::Status WithHostComputeHidden(HloModule* module,
+                                   absl::FunctionRef<absl::Status()> fn);
 
 
 }  // namespace gpu

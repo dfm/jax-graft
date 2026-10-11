@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -12,6 +14,8 @@
 #include "metal_pjrt/blas/blas_lt_support.h"
 #include "metal_pjrt/compiler/passes/dot_upcast.h"
 #include "metal_pjrt/compiler/passes/hlo_checks.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/transforms/simplifiers/convolution_group_converter.h"
@@ -437,31 +441,91 @@ ENTRY e {
   EXPECT_TRUE(CheckPostGemmRewriter(**module).ok());
 }
 
-// XLA would compile a host-offloaded region with XLA:CPU (no metal$
-// handlers there) and CHECK-fail; refused before any pass runs.
-TEST_F(MetalHloChecksTest, HostOffloadingIsRefused) {
+// compute_on("device_host") regions run on the CPU: hidden from the
+// plugin's pipelines (moved to the host thread) while they run, everything
+// they call included, then restored; CheckPostGemmRewriter skips host-thread
+// computations, e.g. f64 arithmetic in one.
+TEST_F(MetalHloChecksTest, HostComputeIsHidden) {
   const std::string kHost = R"(
 HloModule m
+add {
+  a = f64[] parameter(0)
+  b = f64[] parameter(1)
+  ROOT s = f64[] add(a, b)
+}
 f {
   p = f32[4] parameter(0)
-  ROOT r = f32[4] negate(p)
+  d = f64[4] convert(p)
+  z = f64[] constant(0)
+  r = f64[] reduce(d, z), dimensions={0}, to_apply=add
+  ROOT o = f32[] convert(r)
 }
 ENTRY e {
   x = f32[4] parameter(0)
-  ROOT c = f32[4] call(x), to_apply=f, frontend_attributes={_xla_compute_type="$T"}, metadata={op_name="jit(f)/compute_on"}
+  ROOT c = f32[] call(x), to_apply=f, frontend_attributes={_xla_compute_type="$T"}
 })";
-  auto check = [&](const std::string& type) {
+  for (const std::string type : {"host", "dense"}) {
     auto module = ParseAndReturnUnverifiedModule(
         absl::StrReplaceAll(kHost, {{"$T", type}}));
-    EXPECT_TRUE(module.ok()) << module.status();
-    if (!module.ok()) return module.status();
-    return CheckBeforeOptimization(**module);
-  };
-  absl::Status host = check("host");
-  EXPECT_EQ(host.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_NE(host.message().find("compute_on"), std::string::npos) << host;
-  // What JAX writes for compute_on("device") (mlir.map_compute_type).
-  EXPECT_TRUE(check("dense").ok());
+    ASSERT_TRUE(module.ok()) << module.status();
+    HloModule* m = module->get();
+    std::vector<std::string> seen;
+    absl::Status status = WithHostComputeHidden(m, [&] {
+      for (HloComputation* comp :
+           m->computations({HloInstruction::kMainExecutionThread})) {
+        seen.emplace_back(comp->name());
+      }
+      return absl::OkStatus();
+    });
+    ASSERT_TRUE(status.ok()) << status;
+    if (type == "host") {
+      EXPECT_THAT(seen, ::testing::ElementsAre("e"));
+    } else {  // compute_on("device"): an ordinary call
+      EXPECT_EQ(seen.size(), 3);
+    }
+    for (HloComputation* comp : m->computations()) {
+      EXPECT_TRUE(comp->IsMainThread()) << comp->name();
+    }
+    // The f64 reduce is refused on the GPU, not in a host computation.
+    if (type == "host") {
+      m->GetComputationWithName("f")->SetExecutionThread(
+          HloInstruction::kHostThread);
+      m->GetComputationWithName("add")->SetExecutionThread(
+          HloInstruction::kHostThread);
+      EXPECT_TRUE(CheckPostGemmRewriter(*m).ok());
+    } else {
+      EXPECT_EQ(CheckPostGemmRewriter(*m).code(),
+                absl::StatusCode::kUnimplemented);
+    }
+  }
+}
+
+// A custom call XLA:CPU has no handler for (here jaxlib's CPU Cholesky,
+// which JAX's CPU lowering emits in a compute_on region) would abort the
+// process in XLA:CPU's compile; refused instead.
+TEST_F(MetalHloChecksTest, UnknownCallInHostComputeIsRefused) {
+  auto module = ParseAndReturnUnverifiedModule(R"(
+HloModule m
+f {
+  p = f64[4,4] parameter(0)
+  ROOT r = (f64[4,4], s32[]) custom-call(p), custom_call_target="lapack_dpotrf_ffi", api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(f)/cholesky"}
+}
+ENTRY e {
+  x = f64[4,4] parameter(0)
+  ROOT c = (f64[4,4], s32[]) call(x), to_apply=f, frontend_attributes={_xla_compute_type="host"}
+})");
+  ASSERT_TRUE(module.ok()) << module.status();
+  bool ran = false;
+  absl::Status status = WithHostComputeHidden(module->get(), [&] {
+    ran = true;
+    return absl::OkStatus();
+  });
+  EXPECT_FALSE(ran);
+  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_NE(status.message().find("lapack_dpotrf_ffi"), std::string::npos)
+      << status;
+  EXPECT_NE(status.message().find("jit(f)/cholesky"), std::string::npos)
+      << status;
 }
 
 // lax.rng_uniform: RngExpander leaves an rng-get-and-update-state, which

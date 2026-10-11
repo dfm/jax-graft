@@ -137,8 +137,10 @@ Messages starting with `Metal:` name your operation and source line:
   jax.random: ...`
 - `Metal: jax.lax.mulhi on 64-bit integers is not supported ...` Use
   32-bit operands, or the CPU backend.
-- `Metal: host offloading (jax.experimental.compute_on("device_host")) is
-  not supported; run that part on the CPU backend instead: ...` Run that
+- `Metal: lapack_dpotrf_ffi inside jax.experimental.compute_on("device_host")
+  is not supported ...` JAX lowers a `compute_on("device_host")` region for
+  the CPU, and its LAPACK calls (Cholesky, triangular solves, LU, ...)
+  belong to jaxlib, not the plugin. Move them out of the region, or run that
   part outside `jit` under `jax.default_device(jax.devices("cpu")[0])`.
 - `Metal: bf16 matmul too large: ... Split the matmul or use float32` and
   `Metal: matmul operand ... has a batch, row or column group of ...

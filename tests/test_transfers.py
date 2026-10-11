@@ -224,6 +224,35 @@ def test_memory_kinds_inside_jit():
     np.testing.assert_array_equal(np.asarray(out), 3 * np.arange(8))
 
 
+def test_compute_on_host():
+    # compute_on("device_host") regions run on the CPU (XLA's HostExecute,
+    # zero-copy on unified memory), so they may compute in f64.
+    from jax.experimental.compute_on import compute_on
+    on_host = compute_on(compute_type="device_host",
+                         out_memory_spaces=jax.memory.Space.Device)
+    x = jnp.linspace(1, 2, 8, dtype=jnp.float32)
+    with jax.enable_x64(True):
+        piece = on_host(lambda z: jnp.sum(jnp.log1p(
+            z.astype(jnp.float64) ** 2)).astype(jnp.float32))
+        f = jax.jit(lambda x: x * piece(x))
+        want = np.float32(np.sum(np.log1p(np.asarray(x, np.float64) ** 2)))
+        np.testing.assert_allclose(np.asarray(f(x)), np.asarray(x) * want,
+                                   rtol=1e-6)
+        g = jax.jit(jax.grad(lambda x: jnp.sum(f(x))))(x)
+        assert np.all(np.isfinite(np.asarray(g)))
+        # A host call per iteration.
+        _, s = jax.jit(lambda x: jax.lax.scan(
+            lambda c, _: (c * 0.5, piece(c)), x, None, length=20))(x)
+        assert np.asarray(s)[0] == want
+        # JAX lowers the region for the CPU; its LAPACK calls are jaxlib's,
+        # which this plugin cannot run: refused at compile time (XLA would
+        # abort the process).
+        chol = on_host(lambda a: jnp.linalg.cholesky(a.astype(jnp.float64)))
+        with pytest.raises(Exception, match="lapack_dpotrf_ffi"):
+            jax.jit(lambda a: chol(a).astype(jnp.float32))(
+                jnp.eye(4, dtype=jnp.float32))
+
+
 def _memory_stats():
     import jax_graft
     lib = ctypes.CDLL(str(jax_graft._get_library_path()))
