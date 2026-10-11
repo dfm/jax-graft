@@ -144,7 +144,12 @@ Messages starting with `Metal:` name your operation and source line:
   version, or one jaxlib's FFI version does not match (logged as `cannot use
   jaxlib's host FFI handler` at startup or first compile). Move it out of the
   region, or run that part outside `jit` under
-  `jax.default_device(jax.devices("cpu")[0])`.
+  `jax.default_device(jax.devices("cpu")[0])`. For `lapack_*_ffi` this
+  can also mean no region has been lowered yet in this process (the
+  plugin registers jaxlib's LAPACK when the first one is): a function
+  deserialized with `jax.export` in a fresh process does not lower one, so
+  run any `compute_on("device_host")` region with linear algebra under
+  `jit` first.
 - `Metal: bf16 matmul too large: ... Split the matmul or use float32` and
   `Metal: matmul operand ... has a batch, row or column group of ...
   elements; XLA's matmul config counts them in 32 bits. Split the batch
