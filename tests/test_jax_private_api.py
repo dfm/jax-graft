@@ -66,13 +66,16 @@ SIGNATURES = {
     "mlir.ModuleContext.add_host_callback": (
         mlir.ModuleContext.add_host_callback, "(self, host_callback)"),
     # reduction_op is new in jax 0.11 (unused here); replicated_axes was a
-    # tuple in 0.10.0.
+    # tuple in 0.10.0; unreduced_axes and reduction_op are gone after 0.12.0
+    # (jax-ml/jax@ca8ae6f; the plugin passes neither).
     "SdyArray": (
         SdyArray,
         tuple("(*, mesh_shape, dim_shardings, logical_device_ids=None, "
               f"replicated_axes={r}, unreduced_axes=frozenset(){op})"
               for r, op in (("frozenset()", ", reduction_op=None"),
-                            ("frozenset()", ""), ("()", "")))),
+                            ("frozenset()", ""), ("()", "")))
+        + ("(*, mesh_shape, dim_shardings, logical_device_ids=None, "
+           "replicated_axes=frozenset())",)),
     "SdyArrayList": (SdyArrayList, "(shardings)"),
     # __init__.py
     "compilation_cache.is_cache_used": (
@@ -82,9 +85,14 @@ SIGNATURES = {
         "(plugin_name, *, priority=400, library_path=None, options=None, "
         "c_api=None, factory=None, make_topology=None)"),
     # _lowerings.py
+    # The keyword-only shard_map arguments are new after 0.12.0, for
+    # jax_shard_map_partitioning; the plugin registers no collectives and
+    # leaves the passthrough set (keyed by primitive) as upstream filled it.
     "mlir.register_lowering": (
         mlir.register_lowering,
-        "(prim, rule, platform=None, inline=True, cacheable=True)"),
+        ("(prim, rule, platform=None, inline=True, cacheable=True)",
+         "(prim, rule, platform=None, inline=True, cacheable=True, *, "
+         "shard_map_collective_rule=None, shard_map_passthrough=False)")),
     "mlir.lower_fun": (mlir.lower_fun, "(fun, multiple_results=True)"),
     "checkify.check_lowering_rule_unsupported": (
         checkify.check_lowering_rule_unsupported, "(*a, debug, **k)"),
