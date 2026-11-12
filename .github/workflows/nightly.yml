@@ -17,7 +17,11 @@ name: JAX nightly
 
 on:
   schedule:
-    - cron: "17 7 * * *"         # daily; JAX's nightlies are built overnight (US)
+    # Daily at 10:41 UTC: after JAX's nightlies are built overnight (US), and
+    # off the top of the hour and outside US working hours, when GitHub's
+    # macOS runners are busiest. A run that waits too long for a macos-26
+    # runner is cancelled before any step runs; that is not a JAX breakage.
+    - cron: "41 10 * * *"
   workflow_dispatch:
     inputs:
       jax:
@@ -80,6 +84,13 @@ jobs:
             uv pip install --python "$V" "jax==$JAX" "jaxlib==$JAX"
           fi
           "$V" -c "import jax, jaxlib; print('jax', jax.__version__, 'jaxlib', jaxlib.__version__)"
+          if [[ "$JAX" == nightly ]]; then
+            # The schedule is meant to follow JAX's nightly build; say so if
+            # it ran before today's landed (the run still tests the latest).
+            today="dev$(date -u +%Y%m%d)"
+            ver=$("$V" -c "import jax; print(jax.__version__)")
+            [[ "$ver" == *"$today"* ]] || echo "::warning::jax $ver is not today's nightly ($today); move the cron later"
+          fi
           {
             echo "Wheels: ci.yml run ${{ steps.wheels.outputs.run }} (main @ ${{ steps.wheels.outputs.sha }})"
             echo
