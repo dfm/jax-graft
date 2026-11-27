@@ -48,10 +48,14 @@ SIGNATURES = {
         "(ctx, callback, token, operands, operand_avals, result_avals, *, "
         "has_side_effect, returns_token=True, partitioned=False, "
         "sharding=None)"),
+    # devices is gone after 0.12.0 (jax-ml/jax@b4be0b22c); the wrapper binds
+    # by name and uses only executable_devices.
     "compiler.compile_or_get_cached": (
         compiler.compile_or_get_cached,
-        "(backend, computation, devices, compile_options, host_callbacks, "
-        "executable_devices, pgle_profiler=None)"),
+        ("(backend, computation, devices, compile_options, host_callbacks, "
+         "executable_devices, pgle_profiler=None)",
+         "(backend, computation, compile_options, host_callbacks, "
+         "executable_devices, pgle_profiler=None)")),
     "compiler.backend_compile_and_load": (
         compiler.backend_compile_and_load,
         "(backend, module, executable_devices, options, host_callbacks)"),
@@ -86,13 +90,16 @@ SIGNATURES = {
         "c_api=None, factory=None, make_topology=None)"),
     # _lowerings.py
     # The keyword-only shard_map arguments are new after 0.12.0, for
-    # jax_shard_map_partitioning; the plugin registers no collectives and
-    # leaves the passthrough set (keyed by primitive) as upstream filled it.
+    # jax_shard_map_partitioning; shard_map_passthrough was then removed
+    # (jax-ml/jax@d3f12669d). The plugin passes neither, and leaves the
+    # collective rules (keyed by primitive) as upstream filled them.
     "mlir.register_lowering": (
         mlir.register_lowering,
-        ("(prim, rule, platform=None, inline=True, cacheable=True)",
-         "(prim, rule, platform=None, inline=True, cacheable=True, *, "
-         "shard_map_collective_rule=None, shard_map_passthrough=False)")),
+        tuple("(prim, rule, platform=None, inline=True, cacheable=True"
+              + extra + ")"
+              for extra in ("", ", *, shard_map_collective_rule=None",
+                            ", *, shard_map_collective_rule=None, "
+                            "shard_map_passthrough=False"))),
     "mlir.lower_fun": (mlir.lower_fun, "(fun, multiple_results=True)"),
     "checkify.check_lowering_rule_unsupported": (
         checkify.check_lowering_rule_unsupported, "(*a, debug, **k)"),
@@ -236,10 +243,12 @@ def test_cache_bypass_only_for_mtl_callbacks():
     mtl = type("B", (), {"platform": "mtl"})()
     cpu = type("B", (), {"platform": "cpu"})()
     bypass = lambda *a, **k: callbacks._cache_bypass_arguments(sig, a, k)  # noqa: E731
-    assert bypass(mtl, "hlo", [], "opts", [ours], []) is not None
-    assert bypass(mtl, "hlo", [], "opts", host_callbacks=[other, ours],
+    # devices, before compile_options, is gone after jax 0.12.0.
+    dev = ([],) if "devices" in sig.parameters else ()
+    assert bypass(mtl, "hlo", *dev, "opts", [ours], []) is not None
+    assert bypass(mtl, "hlo", *dev, "opts", host_callbacks=[other, ours],
                   executable_devices=[])["computation"] == "hlo"
-    assert bypass(mtl, "hlo", [], "opts", [other], []) is None
-    assert bypass(cpu, "hlo", [], "opts", [ours], []) is None
+    assert bypass(mtl, "hlo", *dev, "opts", [other], []) is None
+    assert bypass(cpu, "hlo", *dev, "opts", [ours], []) is None
     assert bypass() is None
-    assert bypass(mtl, "hlo", [], "opts", [ours], [], None, "extra") is None
+    assert bypass(mtl, "hlo", *dev, "opts", [ours], [], None, "extra") is None
